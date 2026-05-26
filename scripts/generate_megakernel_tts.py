@@ -494,10 +494,10 @@ class TalkerDecoder:
                         pred.sequences[..., i:i+1].to(dev)
                     ).float().squeeze()
                     residual_sum += r_embed
+                residual_codes = pred.sequences[0].detach().cpu()   # [15] — detach before leaving ctx
+                step_embed = (last_id_hidden.squeeze().float() + residual_sum).clone()
 
-            residual_codes = pred.sequences[0].cpu()   # [15]
             all_codes = torch.cat([torch.tensor([first_code]), residual_codes])  # [16]
-            step_embed = last_id_hidden.squeeze().float() + residual_sum
         else:
             all_codes  = torch.tensor([first_code])
             step_embed = last_id_hidden.squeeze().float()
