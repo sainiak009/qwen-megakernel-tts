@@ -487,16 +487,16 @@ class TalkerDecoder:
                     do_sample=False,
                     return_dict_in_generate=True,
                 )
+                embed_fns = self._code_predictor.get_input_embeddings()
+                residual_sum = torch.zeros(HIDDEN_SIZE, device=dev, dtype=torch.float32)
+                for i in range(self._num_residual):
+                    r_embed = embed_fns[i](
+                        pred.sequences[..., i:i+1].to(dev)
+                    ).float().squeeze()
+                    residual_sum += r_embed
+
             residual_codes = pred.sequences[0].cpu()   # [15]
             all_codes = torch.cat([torch.tensor([first_code]), residual_codes])  # [16]
-
-            residual_sum = torch.zeros(HIDDEN_SIZE, device=dev, dtype=torch.float32)
-            embed_fns = self._code_predictor.get_input_embeddings()
-            for i in range(self._num_residual):
-                r_embed = embed_fns[i](
-                    pred.sequences[..., i:i+1].to(dev)
-                ).float().squeeze()
-                residual_sum += r_embed
             step_embed = last_id_hidden.squeeze().float() + residual_sum
         else:
             all_codes  = torch.tensor([first_code])
