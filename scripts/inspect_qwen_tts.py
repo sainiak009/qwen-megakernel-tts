@@ -148,20 +148,16 @@ def inspect_live_model(model_name="Qwen/Qwen3-TTS-12Hz-0.6B-Base"):
     print("(requires ~2 GB download on first run)")
     try:
         import torch
-        from transformers import AutoConfig, AutoModelForCausalLM
+        from qwen_tts import Qwen3TTSModel
     except ImportError:
-        print("transformers not installed; skipping live inspection.")
+        print("qwen-tts not installed; run: pip install qwen-tts>=0.1.1")
         return
 
-    cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    print(f"\nConfig model_type: {cfg.model_type}")
-
-    print("\nLoading model (this downloads weights)...")
-    model = AutoModelForCausalLM.from_pretrained(
+    print("\nLoading model via qwen-tts (downloads weights on first run)...")
+    model = Qwen3TTSModel.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
         device_map="cpu",
-        trust_remote_code=True,
+        dtype=torch.bfloat16,
     )
 
     print("\nState dict keys and shapes (first 60 keys):")

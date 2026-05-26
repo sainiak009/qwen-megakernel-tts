@@ -90,19 +90,17 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
     Returns weights dict compatible with the megakernel Decoder constructor,
     plus the speech_tokenizer for audio decoding.
     """
-    from transformers import AutoModelForCausalLM
+    from qwen_tts import Qwen3TTSModel
 
     if verbose:
         print(f"Loading {model_id} ...")
     t0 = time.time()
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model = Qwen3TTSModel.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16,
         device_map="cuda",
-        trust_remote_code=True,
+        dtype=torch.bfloat16,
     )
-    model.eval()
 
     if verbose:
         print(f"  Loaded in {time.time() - t0:.1f}s")

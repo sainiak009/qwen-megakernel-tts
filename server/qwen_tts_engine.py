@@ -90,13 +90,12 @@ class QwenTTSEngine:
         if self._loaded:
             return
 
-        from transformers import AutoTokenizer
-        self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
-
         if self.use_megakernel:
             try:
                 from scripts.generate_megakernel_tts import TalkerDecoder
+                from transformers import AutoTokenizer
                 self._decoder = TalkerDecoder(model_id=self.model_id, verbose=self.verbose)
+                self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
                 if self.verbose:
                     print("Megakernel backend loaded.")
             except Exception as e:
@@ -104,16 +103,14 @@ class QwenTTSEngine:
                 self.use_megakernel = False
 
         if not self.use_megakernel:
-            from transformers import AutoModelForCausalLM
-            self._hf_model = AutoModelForCausalLM.from_pretrained(
+            from qwen_tts import Qwen3TTSModel
+            self._hf_model = Qwen3TTSModel.from_pretrained(
                 self.model_id,
-                torch_dtype=torch.bfloat16,
                 device_map="cuda",
-                trust_remote_code=True,
+                dtype=torch.bfloat16,
             )
-            self._hf_model.eval()
             if self.verbose:
-                print("HF baseline backend loaded.")
+                print("HF baseline backend loaded (qwen-tts).")
 
         self._loaded = True
 
@@ -213,35 +210,31 @@ class QwenTTSEngine:
             yield chunk
 
     async def _stream_hf(self, text: str) -> AsyncGenerator[bytes, None]:
-        """HuggingFace path (non-streaming fallback): generate all, then yield in chunks."""
+        """
+        qwen-tts path: generate complete audio then yield in PCM chunks.
+        Uses Qwen3TTSModel.generate_custom_voice() with a default speaker.
+        """
         loop = asyncio.get_event_loop()
         model = self._hf_model
-        tokenizer = self._tokenizer
-        chunk_codes = self.chunk_codes
+        chunk_size = self.chunk_codes * 2000  # ~chunk_codes codec frames worth of samples
 
         def _run():
-            with torch.no_grad():
-                inputs = tokenizer(text, return_tensors="pt").to("cuda")
-                output = model.generate(
-                    **inputs,
-                    max_new_tokens=self.max_audio_tokens,
-                    do_sample=True,
-                    temperature=0.9,
-                    top_k=50,
-                )
-            # Strip input tokens
-            n_in = inputs["input_ids"].shape[-1]
-            codec_ids = output[0, n_in:].cpu().tolist()
-            return codec_ids
+            audio_list, sr = model.generate_custom_voice(
+                text=text,
+                language="English",
+                speaker="default",
+            )
+            if isinstance(audio_list, (list, tuple)):
+                audio = np.concatenate([np.array(a, dtype=np.float32).squeeze() for a in audio_list if len(a) > 0])
+            else:
+                audio = np.array(audio_list, dtype=np.float32).squeeze()
+            return audio, sr
 
-        codec_ids = await loop.run_in_executor(None, _run)
+        audio, sr = await loop.run_in_executor(None, _run)
 
-        # Yield chunks
-        for i in range(0, len(codec_ids), chunk_codes):
-            chunk = codec_ids[i : i + chunk_codes]
-            audio = self._decode_codes_to_audio(chunk)
-            if audio is not None:
-                yield _pcm16_bytes(audio)
+        # Yield in chunks so Pipecat gets frames progressively
+        for i in range(0, len(audio), chunk_size):
+            yield _pcm16_bytes(audio[i : i + chunk_size])
 
     def generate_wav(self, text: str) -> bytes:
         """Non-streaming: return complete WAV file bytes."""

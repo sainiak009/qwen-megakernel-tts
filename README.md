@@ -60,10 +60,14 @@ Numbers assume RTX 5090, CUDA 12.8, bf16. See `benchmarks/results.md` for measur
 ## Setup
 
 ```bash
-# 1. Clone and install megakernel (requires RTX 5090 + CUDA 12.8)
-pip install git+https://github.com/AlpinDale/qwen_megakernel
+# 1. Clone megakernel (no setup.py — must clone manually)
+git clone https://github.com/AlpinDale/qwen_megakernel.git
+cd qwen_megakernel && pip install -r requirements.txt && cd ..
+export PYTHONPATH="$(pwd)/qwen_megakernel:$PYTHONPATH"
 
-# 2. Install project dependencies
+# 2. Clone this repo and install dependencies
+git clone <this-repo-url>
+cd qwen-megakernel-tts
 pip install -r requirements.txt
 ```
 

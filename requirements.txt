@@ -1,5 +1,6 @@
 torch>=2.5.0
 transformers>=4.57.0
+qwen-tts>=0.1.1
 accelerate>=0.30.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
@@ -12,4 +13,6 @@ aiohttp>=3.9.0
 loguru>=0.7.0
 
 # Install megakernel from source (requires CUDA 12.8+, RTX 5090 / sm_120):
-# pip install git+https://github.com/AlpinDale/qwen_megakernel
+# git clone https://github.com/AlpinDale/qwen_megakernel.git
+# cd qwen_megakernel && pip install -r requirements.txt && cd ..
+# export PYTHONPATH="$(pwd)/qwen_megakernel:$PYTHONPATH"
