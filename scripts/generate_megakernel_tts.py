@@ -143,54 +143,74 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
             print(f"  Final norm (fallback): {norm_key}")
     final_norm = sd[norm_key].contiguous()
 
-    # ── Diagnostic: print all embed-related keys so we know what's actually there
+    # ── Diagnostic: print all non-layer talker keys to find projection weights
     if verbose:
-        embed_keys = [(k, list(v.shape)) for k, v in sd.items() if "embed" in k.lower()]
-        print(f"  Embed keys in state dict: {embed_keys}")
+        talker_top_keys = [(k, list(v.shape)) for k, v in sd.items()
+                           if k.startswith(prefix) and "layers." not in k]
+        print(f"  Talker non-layer keys: {talker_top_keys}")
 
-    # ── 3. Audio embed_tokens (talker's own embed, vocab=3072) ───────────────
-    # Try exact match first; fall back to first 3072 rows of a larger embed under talker prefix
+    # ── 3. Audio embed: talker.model.codec_embedding.weight [3072, 1024] ─────
     audio_embed = None
     for k, v in sd.items():
-        if "embed_tokens" in k and v.shape[0] == TTS_AUDIO_VOCAB:
+        if "codec_embedding" in k and prefix in k and v.shape == (TTS_AUDIO_VOCAB, HIDDEN_SIZE):
             audio_embed = v.contiguous()
             if verbose:
-                print(f"  Audio embed_tokens: {k}  {list(v.shape)}")
+                print(f"  Audio embed: {k}  {list(v.shape)}")
             break
     if audio_embed is None:
-        # Talker may share one embed table for both text and audio tokens.
-        # Slice first TTS_AUDIO_VOCAB rows as the audio embed.
+        # Fallback: any embed under talker prefix with [3072, 1024]
         for k, v in sd.items():
-            if "embed_tokens" in k and prefix in k and v.shape[0] >= TTS_AUDIO_VOCAB:
-                audio_embed = v[:TTS_AUDIO_VOCAB].contiguous()
+            if prefix in k and len(v.shape) == 2 and v.shape == (TTS_AUDIO_VOCAB, HIDDEN_SIZE):
+                audio_embed = v.contiguous()
                 if verbose:
-                    print(f"  Audio embed_tokens (sliced [:3072] from {k}  {list(v.shape)})")
+                    print(f"  Audio embed (fallback): {k}  {list(v.shape)}")
                 break
     if audio_embed is None:
         raise RuntimeError(
-            f"Could not find talker audio embed_tokens. "
-            f"Embed keys found: {[(k, list(v.shape)) for k, v in sd.items() if 'embed' in k.lower()]}"
+            f"Could not find audio embed [3072, 1024]. "
+            f"Talker non-layer keys: {[(k, list(v.shape)) for k, v in sd.items() if k.startswith(prefix) and 'layers.' not in k]}"
         )
 
-    # ── 4. Text embed_tokens (151936×1024, for prefill via step()) ───────────
-    text_embed = None
+    # ── 4. Text embed + optional projection to HIDDEN_SIZE ───────────────────
+    # talker.model.text_embedding.weight is [151936, 2048] — needs projection to 1024.
+    # Look for a text_proj linear (2048→1024) under the talker prefix.
+    text_embed_raw = None
+    text_proj = None
     for k, v in sd.items():
-        if "embed_tokens" in k and v.shape[0] == KERNEL_VOCAB_SIZE:
-            text_embed = v.contiguous()
+        if "text_embedding" in k and prefix in k and v.shape[0] == KERNEL_VOCAB_SIZE:
+            text_embed_raw = v.contiguous()
             if verbose:
-                print(f"  Text embed_tokens:  {k}  {list(v.shape)}")
+                print(f"  Text embed raw: {k}  {list(v.shape)}")
             break
-    if text_embed is None:
-        # Use the talker's embed table for text prefill as well (same weights)
+    if text_embed_raw is not None and text_embed_raw.shape[1] != HIDDEN_SIZE:
+        # Look for a projection weight that maps text_embed dim → HIDDEN_SIZE
+        text_dim = text_embed_raw.shape[1]
         for k, v in sd.items():
-            if "embed_tokens" in k and prefix in k:
-                text_embed = v.contiguous()
-                if verbose:
-                    print(f"  Text embed_tokens (using full {k}  {list(v.shape)} for prefill)")
-                break
-    if text_embed is None:
+            if prefix in k and "layers." not in k and len(v.shape) == 2:
+                if v.shape == (HIDDEN_SIZE, text_dim) or v.shape == (text_dim, HIDDEN_SIZE):
+                    text_proj = v.contiguous()
+                    if verbose:
+                        print(f"  Text projection: {k}  {list(v.shape)}")
+                    break
+
+    # Build final text_embed: project down to HIDDEN_SIZE if needed
+    if text_embed_raw is not None:
+        if text_proj is not None:
+            # Project: [151936, text_dim] @ [text_dim, 1024] → [151936, 1024]
+            w = text_proj if text_proj.shape[0] == HIDDEN_SIZE else text_proj.T
+            text_embed = (text_embed_raw.float() @ w.float().T).to(torch.bfloat16).contiguous()
+            if verbose:
+                print(f"  Text embed projected: {list(text_embed.shape)}")
+        elif text_embed_raw.shape[1] == HIDDEN_SIZE:
+            text_embed = text_embed_raw
+        else:
+            # Dimension mismatch and no projection found — truncate as last resort
+            if verbose:
+                print(f"  Warning: text embed dim {text_embed_raw.shape[1]} != {HIDDEN_SIZE}, truncating")
+            text_embed = text_embed_raw[:, :HIDDEN_SIZE].contiguous()
+    else:
         if verbose:
-            print("  Warning: could not find embed_tokens for text prefill; using audio embed")
+            print("  Warning: no text_embedding found; text prefill uses audio embed")
         text_embed = audio_embed
 
     # ── 5. Audio LM head (codec_head) padded to kernel's VOCAB_SIZE ──────────
