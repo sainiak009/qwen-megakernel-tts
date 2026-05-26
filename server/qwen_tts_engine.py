@@ -171,7 +171,8 @@ class QwenTTSEngine:
 
         def thread_fn():
             try:
-                text_ids = tokenizer.encode(text, add_special_tokens=True)
+                from scripts.generate_megakernel_tts import _format_tts_text
+                text_ids = tokenizer.encode(_format_tts_text(text), add_special_tokens=False)
                 decoder.reset()
                 torch.cuda.synchronize()
 

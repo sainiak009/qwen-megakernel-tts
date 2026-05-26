@@ -323,3 +323,58 @@ which is acceptable for the fallback path — the output is intelligible, just n
 **Lesson:** Always check the vendor API docs / source for model-type guards before calling a generation
 method. The `tts_model_type` attribute lives on `model.model` (the inner `Qwen3TTSForConditionalGeneration`),
 not on the `Qwen3TTSModel` wrapper.
+
+---
+
+## Issue #9 — Empty WAV (44 bytes) — wrong prefill embed sequence
+
+**Symptom:** Server returns HTTP 200 with a 44-byte WAV (header only, no audio frames). No error in logs.
+
+**Root cause:** `prefill_text()` was feeding `text_projection(text_embedding(raw_text_ids))` directly into
+the kernel — just the raw text token projections one-by-one. The actual talker backbone expects a specific
+**8-token composite prefill sequence** that mixes text and codec embeddings. Without this structure, the
+backbone never enters "audio generation mode" and predicts EOS (token 2150) as the first audio code,
+causing `generate_audio_codes_iter()` to return immediately with zero codes.
+
+**Root cause discovery:** Read `Qwen3TTSForConditionalGeneration.generate()` in
+`modeling_qwen3_tts.py` line 2022+. The actual embed sequence passed to `talker.generate()` is:
+
+```
+[0] text_proj(<|im_start|>)
+[1] text_proj(assistant)
+[2] text_proj(\n)
+[3] text_proj(tts_pad=151671) + audio_embed(codec_nothink=2155)   ← summed
+[4] text_proj(tts_pad=151671) + audio_embed(codec_think_bos=2156) ← summed
+[5] text_proj(tts_pad=151671) + audio_embed(codec_think_eos=2157) ← summed
+[6] text_proj(tts_bos=151672) + audio_embed(codec_pad=2148)       ← summed
+[7] text_proj(text_token[0]) + audio_embed(codec_bos=2149)        ← summed
+```
+
+After these 8 tokens, autoregressive decode begins. Per-step text conditioning:
+```
+trailing_text_hidden[i] = text_proj(text_token[i+1])  for i < len(text_body)-1
+trailing_text_hidden[-1] = text_proj(tts_eos=151673)
+```
+
+**Additional required change:** input text must be formatted before tokenizing:
+```python
+# WRONG (raw text):
+text_ids = tokenizer.encode(text, add_special_tokens=True)
+
+# CORRECT (chat template):
+formatted = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+text_ids  = tokenizer.encode(formatted, add_special_tokens=False)
+```
+This produces exactly 3 role-prefix tokens + N text-body tokens + 5 trailing tokens.
+
+**Fix:**
+- `load_tts_weights()`: extract 7 additional token IDs from config (`codec_pad_id`, `codec_nothink_id`,
+  `codec_think_bos_id`, `codec_think_eos_id`, `tts_bos_token_id`, `tts_eos_token_id`, `tts_pad_token_id`).
+- `TalkerDecoder`: store the new IDs.
+- `prefill_text()`: completely rewritten to build the 8-token composite embed sequence above.
+- `_stream_megakernel()` (engine): use `_format_tts_text(text)` and `add_special_tokens=False`.
+- `benchmark()` / `main()`: same text format fix.
+
+**Lesson:** The talker backbone does not accept plain text tokens — it requires a chat-formatted sequence
+where codec tag embeddings are **summed** with TTS special token projections. This conditioning pattern
+is only visible by reading `modeling_qwen3_tts.py` line 2124–2232 in full.

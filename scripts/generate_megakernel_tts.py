@@ -100,6 +100,7 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
         copied to contiguous CUDA tensors for the kernel.
       - talker_module: the nn.Module for text_projection + code_predictor access.
         Thinker and other heavy modules are released to free VRAM.
+      - All special token IDs needed to reproduce the exact prefill embed sequence.
     """
     from qwen_tts import Qwen3TTSModel
 
@@ -188,9 +189,24 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
     # ── 5. Config values ──────────────────────────────────────────────────────
     cfg = getattr(inner, "config", None) or getattr(model, "config", None)
     talker_cfg = getattr(cfg, "talker_config", cfg) if cfg else None
-    codec_eos_id    = getattr(talker_cfg, "codec_eos_token_id", 2150) if talker_cfg else 2150
-    codec_bos_id    = getattr(talker_cfg, "codec_bos_id",       2149) if talker_cfg else 2149
-    num_code_groups = getattr(talker_cfg, "num_code_groups",      16) if talker_cfg else 16
+
+    def _tc(attr, default):
+        return getattr(talker_cfg, attr, default) if talker_cfg else default
+
+    def _cc(attr, default):
+        return getattr(cfg, attr, default) if cfg else default
+
+    codec_eos_id       = _tc("codec_eos_token_id", 2150)
+    codec_bos_id       = _tc("codec_bos_id",       2149)
+    codec_pad_id       = _tc("codec_pad_id",       2148)
+    codec_nothink_id   = _tc("codec_nothink_id",   2155)
+    codec_think_bos_id = _tc("codec_think_bos_id", 2156)
+    codec_think_eos_id = _tc("codec_think_eos_id", 2157)
+    num_code_groups    = _tc("num_code_groups",       16)
+    tts_bos_token_id   = _cc("tts_bos_token_id",  151672)
+    tts_eos_token_id   = _cc("tts_eos_token_id",  151673)
+    tts_pad_token_id   = _cc("tts_pad_token_id",  151671)
+
     if verbose:
         print(f"  codec_eos_id={codec_eos_id}  codec_bos_id={codec_bos_id}  num_code_groups={num_code_groups}")
 
@@ -208,15 +224,22 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
         print("  All weights loaded and remapped.")
 
     return {
-        "audio_embed":       audio_embed,
-        "layer_weights":     layer_weights,
-        "final_norm_weight": final_norm,
-        "padded_lm_head":    padded_lm_head,
-        "codec_eos_id":      codec_eos_id,
-        "codec_bos_id":      codec_bos_id,
-        "num_code_groups":   num_code_groups,
-        "talker_module":     talker_module,
-        "speech_tokenizer":  speech_tokenizer,
+        "audio_embed":         audio_embed,
+        "layer_weights":       layer_weights,
+        "final_norm_weight":   final_norm,
+        "padded_lm_head":      padded_lm_head,
+        "codec_eos_id":        codec_eos_id,
+        "codec_bos_id":        codec_bos_id,
+        "codec_pad_id":        codec_pad_id,
+        "codec_nothink_id":    codec_nothink_id,
+        "codec_think_bos_id":  codec_think_bos_id,
+        "codec_think_eos_id":  codec_think_eos_id,
+        "num_code_groups":     num_code_groups,
+        "tts_bos_token_id":    tts_bos_token_id,
+        "tts_eos_token_id":    tts_eos_token_id,
+        "tts_pad_token_id":    tts_pad_token_id,
+        "talker_module":       talker_module,
+        "speech_tokenizer":    speech_tokenizer,
     }
 
 
@@ -286,10 +309,17 @@ class TalkerDecoder:
             else None
         )
 
-        self.codec_eos_id    = weights["codec_eos_id"]
-        self.codec_bos_id    = weights.get("codec_bos_id", 2149)
-        self._num_residual   = weights.get("num_code_groups", 16) - 1   # 15
-        self.speech_tokenizer = weights["speech_tokenizer"]
+        self.codec_eos_id          = weights["codec_eos_id"]
+        self.codec_bos_id          = weights.get("codec_bos_id",        2149)
+        self._codec_pad_id         = weights.get("codec_pad_id",        2148)
+        self._codec_nothink_id     = weights.get("codec_nothink_id",    2155)
+        self._codec_think_bos_id   = weights.get("codec_think_bos_id",  2156)
+        self._codec_think_eos_id   = weights.get("codec_think_eos_id",  2157)
+        self._tts_bos_id           = weights.get("tts_bos_token_id",  151672)
+        self._tts_eos_id           = weights.get("tts_eos_token_id",  151673)
+        self._tts_pad_id           = weights.get("tts_pad_token_id",  151671)
+        self._num_residual         = weights.get("num_code_groups", 16) - 1   # 15
+        self.speech_tokenizer      = weights["speech_tokenizer"]
 
         # Per-generation state — reset in reset()
         self._trailing_text_hidden: torch.Tensor | None = None
@@ -341,35 +371,94 @@ class TalkerDecoder:
 
     # ── Text prefill ──────────────────────────────────────────────────────────
 
-    def prefill_text(self, text_token_ids: list[int]) -> int:
+    def _proj(self, ids_t: torch.Tensor) -> torch.Tensor:
+        """text_projection(text_embedding(ids_t)) → [N, 1024]."""
+        raw = self._text_embed_raw[ids_t]            # [N, 2048]
+        return self._text_projection(raw.unsqueeze(0)).squeeze(0)  # [N, 1024]
+
+    def prefill_text(self, input_ids: list[int]) -> int:
         """
-        Prefill the backbone with projected text embeddings.
+        Prefill the backbone with the exact embed sequence used by
+        Qwen3TTSForConditionalGeneration.generate() (non-ICL streaming mode).
 
-        Uses talker.text_projection(talker.model.text_embedding(ids)) to get
-        1024-dim vectors, stores them as trailing_text_hidden for per-step
-        conditioning during decode, then runs them through the backbone.
+        input_ids must be the tokenized form of:
+            "<|im_start|>assistant\\n{text}<|im_end|>\\n<|im_start|>assistant\\n"
+        encoded with add_special_tokens=False.
 
-        Returns the first audio code predicted after prefill.
+        Structure expected:
+            input_ids[:3]   = role prefix  [<|im_start|>, assistant, \\n]
+            input_ids[3:-5] = text body    (≥ 1 token)
+            input_ids[-5:]  = trailing     [<|im_end|>, \\n, <|im_start|>, assistant, \\n]
+
+        Prefill sequence fed to the kernel (8 tokens):
+            [0-2]  text_proj(role_prefix)                    — 3 tokens
+            [3]    tts_pad_e + codec_nothink_e               — summed embed
+            [4]    tts_pad_e + codec_think_bos_e             — summed embed
+            [5]    tts_pad_e + codec_think_eos_e             — summed embed
+            [6]    tts_bos_e + codec_pad_e                   — summed embed
+            [7]    text_proj(text[0]) + codec_bos_e          — summed embed
+
+        trailing_text_hidden used per-step during decode:
+            [i]    text_proj(text[i+1])  for i < len(text_body)-1
+            [-1]   tts_eos_embed
+
+        Returns the first predicted audio code ID.
         """
-        if self._text_projection is None or self._text_embed_raw is None:
-            # Fallback: use audio embed table with text token IDs directly
-            # (poor quality but keeps the pipeline running)
-            for tid in text_token_ids[:-1]:
-                self._step(tid % TTS_AUDIO_VOCAB)
-            return self._step(text_token_ids[-1] % TTS_AUDIO_VOCAB)
+        dev = self._text_embed_raw.device
+        ids_t = torch.tensor(input_ids, dtype=torch.long, device=dev)
 
-        ids_t = torch.tensor(text_token_ids, dtype=torch.long,
-                             device=self._text_embed_raw.device)
         with torch.inference_mode():
-            raw = self._text_embed_raw[ids_t]              # [N, 2048]
-            proj = self._text_projection(raw.unsqueeze(0)).squeeze(0)  # [N, 1024]
+            # ── Special TTS embeddings (projected) ───────────────────────────
+            tts_ids = torch.tensor(
+                [self._tts_bos_id, self._tts_eos_id, self._tts_pad_id],
+                dtype=torch.long, device=dev
+            )
+            tts_e = self._proj(tts_ids)          # [3, 1024]
+            tts_bos_e = tts_e[0]
+            tts_eos_e = tts_e[1]
+            tts_pad_e = tts_e[2]
 
-        self._trailing_text_hidden = proj.detach()
+            # ── Codec tag + pad/bos embeddings ───────────────────────────────
+            codec_ids = torch.tensor(
+                [self._codec_nothink_id, self._codec_think_bos_id,
+                 self._codec_think_eos_id, self._codec_pad_id, self.codec_bos_id],
+                dtype=torch.long, device=dev
+            )
+            codec_e = self._audio_embed[codec_ids]   # [5, 1024]
+
+            # ── Role prefix (3 tokens) ────────────────────────────────────────
+            role_e = self._proj(ids_t[:3])           # [3, 1024]
+
+            # ── Combined codec prefix (4 summed tokens) ───────────────────────
+            combined = torch.stack([
+                tts_pad_e + codec_e[0],   # tts_pad + codec_nothink
+                tts_pad_e + codec_e[1],   # tts_pad + codec_think_bos
+                tts_pad_e + codec_e[2],   # tts_pad + codec_think_eos
+                tts_bos_e + codec_e[3],   # tts_bos + codec_pad
+            ])                            # [4, 1024]
+
+            # ── First text token + codec_bos (1 summed token) ─────────────────
+            first_text_e = self._proj(ids_t[3:4]).squeeze(0)   # [1024]
+            first_e = first_text_e + codec_e[4]                # [1024]
+
+            # ── trailing_text_hidden: text[1:-5] tokens + tts_eos ─────────────
+            text_rest_ids = ids_t[4:-5]
+            if text_rest_ids.numel() > 0:
+                rest_e = self._proj(text_rest_ids)              # [M, 1024]
+                trailing = torch.cat([rest_e, tts_eos_e.unsqueeze(0)], dim=0)
+            else:
+                trailing = tts_eos_e.unsqueeze(0)              # [1, 1024]
+
+        self._trailing_text_hidden = trailing.detach()
         self._decode_step = 0
 
-        for i in range(len(text_token_ids) - 1):
-            self._step_with_embed(proj[i])
-        return self._step_with_embed(proj[-1])
+        # Feed 7 prefill tokens (ignore returned code IDs — only updating KV cache)
+        for e in role_e:
+            self._step_with_embed(e)
+        for e in combined:
+            self._step_with_embed(e)
+        # Return the first audio code from the final prefill token
+        return self._step_with_embed(first_e)
 
     # ── Audio code generation ─────────────────────────────────────────────────
 
@@ -452,6 +541,11 @@ class TalkerDecoder:
         return np.array(wavs[0], dtype=np.float32)
 
 
+def _format_tts_text(text: str) -> str:
+    """Wrap plain text in the chat template expected by the talker backbone."""
+    return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+
+
 def benchmark(model_id: str = MODEL_ID, text: str = None, runs: int = 3):
     if text is None:
         text = "The megakernel runs at one thousand tokens per second on an RTX 5090."
@@ -462,7 +556,7 @@ def benchmark(model_id: str = MODEL_ID, text: str = None, runs: int = 3):
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    text_ids = tokenizer.encode(text, add_special_tokens=True)
+    text_ids = tokenizer.encode(_format_tts_text(text), add_special_tokens=False)
     print(f"Text tokens: {len(text_ids)}")
 
     decoder = TalkerDecoder(model_id=model_id, verbose=True)
@@ -531,7 +625,7 @@ def main():
 
     # Generate audio for output
     decoder.reset()
-    text_ids = tokenizer.encode(args.text, add_special_tokens=True)
+    text_ids = tokenizer.encode(_format_tts_text(args.text), add_special_tokens=False)
     first_code = decoder.prefill_text(text_ids)
     audio_codes = decoder.generate_audio_codes(first_code)
 
