@@ -439,3 +439,54 @@ kernel changes: `rm -rf ~/.cache/torch_extensions/py312_cu128/qwen_megakernel_C*
 **Lesson:** When porting a general-purpose LM kernel to a domain-specific model, check whether
 the LM head vocab size can be reduced. The TTS audio vocab is 50× smaller than the text vocab —
 all gains are free (no model quality impact).
+
+---
+
+## Issue #10 — `TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'` — code_predictor called without past_hidden
+
+**Error:**
+```
+File "modeling_qwen3_tts.py", line 1281, in forward
+    inputs_embeds = self.model.get_input_embeddings()[generation_steps - 1](input_ids)
+TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'
+```
+
+**Root cause:** `Qwen3TTSTalkerCodePredictorModelForConditionalGeneration.forward()` has two branches:
+
+```python
+# Prefill (shape[1] > 1): sets generation_steps from input shape
+if inputs_embeds is not None and inputs_embeds.shape[1] > 1:
+    generation_steps = inputs_embeds.shape[1] - 2
+
+# Generation (shape[1] == 1): uses generation_steps to pick codebook embedding
+else:
+    inputs_embeds = self.model.get_input_embeddings()[generation_steps - 1](input_ids)
+```
+
+We passed `inputs_embeds` with shape `[1, 1, 1024]` (just `audio_embed[first_code]`), which
+hit the generation branch with `generation_steps=None` → crash.
+
+**Root cause discovery:** Reading `Qwen3TTSTalkerForConditionalGeneration.forward()` line 1675:
+```python
+predictor_result = self.code_predictor.generate(
+    inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),  # shape [1, 2, 1024]
+    ...
+)
+```
+
+The real call prepends `past_hidden` (the backbone's normalized output from the previous decode step)
+to `last_id_hidden`, producing shape `[1, 2, 1024]` → hits the prefill branch →
+`generation_steps = 2 - 2 = 0` → first residual codebook selected correctly.
+
+**`past_hidden` = `self._norm_out`** — the kernel writes the post-final-norm hidden state `[1024]`
+into `self._norm_out` (float32) after every step. We capture it as `[1, 1, 1024]` bfloat16.
+
+**Fix:**
+- `_step()` and `_step_with_embed()`: after every kernel call, save
+  `self._past_hidden = self._norm_out.to(bfloat16).unsqueeze(0).unsqueeze(0).clone()`
+- `reset()`: clear `self._past_hidden = None`
+- `_compute_step_embed()`: pass `torch.cat([self._past_hidden, last_id_hidden], dim=1)` to
+  `code_predictor.generate()` instead of `last_id_hidden` alone.
+
+**Lesson:** When calling a vendor model's sub-module directly, read its `forward()` signature
+carefully — hidden state conditioning context (`past_hidden`) is a required input, not optional.

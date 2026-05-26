@@ -321,6 +321,7 @@ class TalkerDecoder:
 
         # Per-generation state — reset in reset()
         self._trailing_text_hidden: torch.Tensor | None = None
+        self._past_hidden: torch.Tensor | None = None   # backbone norm_out from previous step
         self._decode_step = 0
 
     # ── Core kernel calls ─────────────────────────────────────────────────────
@@ -329,6 +330,7 @@ class TalkerDecoder:
         self._position = 0
         self._decode_step = 0
         self._trailing_text_hidden = None
+        self._past_hidden = None
         self._k_cache.zero_()
         self._v_cache.zero_()
 
@@ -344,6 +346,7 @@ class TalkerDecoder:
             NUM_LAYERS, self._position, TTS_MAX_SEQ_LEN, self._attn_scale,
         )
         self._position += 1
+        self._past_hidden = self._norm_out.to(torch.bfloat16).unsqueeze(0).unsqueeze(0).clone()
         return self._out_token.item()
 
     def _step_with_embed(self, embed: torch.Tensor) -> int:
@@ -365,6 +368,7 @@ class TalkerDecoder:
             NUM_LAYERS, self._position, TTS_MAX_SEQ_LEN, self._attn_scale,
         )
         self._position += 1
+        self._past_hidden = self._norm_out.to(torch.bfloat16).unsqueeze(0).unsqueeze(0).clone()
         return self._out_token.item()
 
     # ── Text prefill ──────────────────────────────────────────────────────────
@@ -468,30 +472,34 @@ class TalkerDecoder:
         Returns (step_embed [1024], all_codes [16]) where all_codes[0] = first_code
         and all_codes[1:] = residual codes from code_predictor.
         """
-        embed0 = self._audio_embed[first_code].float()   # [1024]
+        dev = self._audio_embed.device
+        last_id_hidden = self._audio_embed[first_code].unsqueeze(0).unsqueeze(0)  # [1,1,1024] bf16
 
-        if self._code_predictor is not None:
-            embed0_t = embed0.unsqueeze(0).unsqueeze(0).to(torch.bfloat16)  # [1,1,1024]
+        if self._code_predictor is not None and self._past_hidden is not None:
+            # Real model passes cat([past_hidden, last_id_hidden]) → shape [1,2,1024]
+            # This triggers the prefill branch in code_predictor.forward (shape[1] > 1)
+            # and sets generation_steps = shape[1] - 2 = 0 for the first residual codebook.
+            pred_input = torch.cat([self._past_hidden.to(dev), last_id_hidden], dim=1)  # [1,2,1024]
             with torch.inference_mode():
                 pred = self._code_predictor.generate(
-                    inputs_embeds=embed0_t,
+                    inputs_embeds=pred_input,
                     max_new_tokens=self._num_residual,
                     do_sample=False,
                 )
             residual_codes = pred.sequences[0].cpu()   # [15]
             all_codes = torch.cat([torch.tensor([first_code]), residual_codes])  # [16]
 
-            residual_sum = torch.zeros(HIDDEN_SIZE, device="cuda", dtype=torch.float32)
+            residual_sum = torch.zeros(HIDDEN_SIZE, device=dev, dtype=torch.float32)
             embed_fns = self._code_predictor.get_input_embeddings()
             for i in range(self._num_residual):
                 r_embed = embed_fns[i](
-                    pred.sequences[..., i:i+1].to(self._audio_embed.device)
+                    pred.sequences[..., i:i+1].to(dev)
                 ).float().squeeze()
                 residual_sum += r_embed
-            step_embed = embed0 + residual_sum
+            step_embed = last_id_hidden.squeeze().float() + residual_sum
         else:
             all_codes  = torch.tensor([first_code])
-            step_embed = embed0
+            step_embed = last_id_hidden.squeeze().float()
 
         # Per-step text conditioning from trailing_text_hidden
         if self._trailing_text_hidden is not None:
