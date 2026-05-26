@@ -1,0 +1,45 @@
+# Project brief (private)
+takehome_project.docx
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets / config
+.env
+*.env.*
+secrets.json
+
+# Model weights & large binaries
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Output audio
+*.wav
+*_codes.txt
+
+# Logs
+*.log
+server.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
