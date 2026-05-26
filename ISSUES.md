@@ -161,3 +161,30 @@ Two sub-issues discovered:
 - Fallback: if no projection found, truncate text_embedding to [:, :1024] as last resort
 
 **Lesson:** Don't assume a TTS model stores separate embedding tables for text and audio, or that embedding dims match the transformer hidden size. Always inspect actual state dict key names and shapes first.
+
+---
+
+## Issue #5 — `'Qwen3TTSModel' object has no attribute 'config'`
+
+**Error:**
+```
+Megakernel load failed ('Qwen3TTSModel' object has no attribute 'config'); falling back to HF baseline.
+```
+
+**Cause:** `Qwen3TTSModel` is a plain wrapper class (not `nn.Module`) — it exposes no `.config`. Our code called `model.config` directly where `model` was the wrapper. `inner = model.model` (the actual `nn.Module`) does have `.config`.
+
+**Fix:** Use `inner.config` instead of `model.config`, with a safe fallback to `model.config` if `inner.config` is absent, and a hardcoded default of `codec_eos_id=2048` if neither is found:
+
+```python
+cfg = getattr(inner, "config", None) or getattr(model, "config", None)
+if cfg is not None:
+    talker_cfg = getattr(cfg, "talker_config", cfg)
+    codec_eos_id = getattr(talker_cfg, "codec_eos_token_id",
+                   getattr(cfg, "codec_eos_token_id", 2048))
+else:
+    codec_eos_id = 2048
+```
+
+**Also discovered in same session:** No text projection layer exists in the talker's non-layer weights (`norm.weight`, `codec_embedding.weight`, `text_embedding.weight` — that's all). The `text_embedding` is 2048-dim with no 2048→1024 linear anywhere in the talker. This strongly suggests the talker **does not take raw text tokens** — it receives hidden states from the thinker model (which likely has hidden_size=2048). Text prefill by feeding raw token IDs through the talker backbone is architecturally incorrect. A different prefill strategy is needed (run thinker first, pass its output as KV-cache seed).
+
+**Lesson:** Check `.config` on the inner `nn.Module`, not on the vendor wrapper class. When no projection is found between embedding dim and hidden dim, the embedding is not meant to feed that transformer directly.
