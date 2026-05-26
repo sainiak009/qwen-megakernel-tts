@@ -105,7 +105,9 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
     if verbose:
         print(f"  Loaded in {time.time() - t0:.1f}s")
 
-    sd = model.state_dict()
+    # Qwen3TTSModel is a wrapper class, not nn.Module — get the inner model
+    inner = model.model if hasattr(model, "model") else model
+    sd = inner.state_dict()
     prefix = _find_talker_prefix(sd)
     if verbose:
         print(f"  Talker transformer prefix: '{prefix}'")
