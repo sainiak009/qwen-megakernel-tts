@@ -91,3 +91,33 @@ uvicorn server.app:app --host 0.0.0.0 --port 8080
 **Lesson:** When a model config shows `model_type: qwen3_tts`, always check if the vendor ships their own inference package before reaching for `transformers.AutoModel*`. Also: `AutoTokenizer` is safe to use even when `AutoModelForCausalLM` fails — they are separate registry lookups.
 
 ---
+
+## Issue #3 — `'Qwen3TTSModel' object has no attribute 'state_dict'`
+
+**Error:**
+```
+Megakernel load failed ('Qwen3TTSModel' object has no attribute 'state_dict'); falling back to HF baseline.
+```
+
+**Cause:** `Qwen3TTSModel` is not an `nn.Module` subclass — it is a plain Python wrapper class. Calling `.state_dict()` directly on it fails. Our `load_tts_weights()` assumed it was a standard PyTorch model.
+
+**Fix:** Access the inner `nn.Module` via `model.model` before calling `.state_dict()`:
+
+*Before (broken):*
+```python
+model = Qwen3TTSModel.from_pretrained(model_id, ...)
+sd = model.state_dict()   # AttributeError
+```
+
+*After (working):*
+```python
+model = Qwen3TTSModel.from_pretrained(model_id, ...)
+inner = model.model if hasattr(model, "model") else model
+sd = inner.state_dict()
+```
+
+This is consistent with how we already probe `model.model.speech_tokenizer` elsewhere in the same function.
+
+**Lesson:** Vendor wrapper classes (like `Qwen3TTSModel`) are not always `nn.Module` subclasses. Always check before calling PyTorch model methods on them.
+
+---
