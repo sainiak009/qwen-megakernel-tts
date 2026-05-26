@@ -234,3 +234,92 @@ The 12Hz speech tokenizer expects: `decode({"audio_codes": tensor[num_codebooks,
 **Fix:** Complete rewrite of `TalkerDecoder` in `generate_megakernel_tts.py` and `_decode_codes_to_audio` + `_stream_megakernel` in `server/qwen_tts_engine.py`.
 
 **Lesson:** Read the vendor's `generate()` source before assuming the architecture. The per-step text conditioning and multi-codebook structure were only visible by reading `modeling_qwen3_tts.py` directly on the instance.
+
+---
+
+## Issue #7 — `qwen_megakernel not installed` — PYTHONPATH not exported at server start
+
+**Error:**
+```
+Megakernel load failed (qwen_megakernel not installed. Clone from github.com/AlpinDale/qwen_megakernel
+and add to PYTHONPATH.); falling back to HF baseline.
+```
+
+**Cause:** `qwen_megakernel` has no `setup.py`/`pyproject.toml` and is not pip-installable. It must be on
+`PYTHONPATH`. When `uvicorn` is launched from a new shell without `export PYTHONPATH=...`, the import
+fails silently and the engine falls back to the HF baseline.
+
+**Fix:** Created `start.sh` at the project root. It:
+1. Validates that `../qwen_megakernel` exists and exits with a clear message if not.
+2. Exports `PYTHONPATH` prepended with the megakernel directory.
+3. Kills any existing listener on the target port.
+4. Launches `uvicorn` via `exec`.
+
+```bash
+bash start.sh            # default: host=0.0.0.0, port=8080
+PORT=9090 bash start.sh  # custom port
+```
+
+**Lesson:** Whenever a dependency must be on `PYTHONPATH`, bake that export into the project's startup
+script rather than relying on shell state. A missing `PYTHONPATH` entry is invisible from error messages
+until the failing import bubbles up.
+
+---
+
+## Issue #8 — `ValueError: tts_model_type: base does not support generate_custom_voice`
+
+**Error:**
+```
+ValueError: model with tokenizer_type: qwen3_tts_tokenizer_12hz, tts_model_size: 0b6,
+tts_model_type: base does not support generate_custom_voice,
+Please check Model Card or Readme for more details.
+```
+
+**Cause:** The qwen-tts library has three completely separate generation APIs, each locked to a specific
+`tts_model_type`:
+
+| API | tts_model_type |
+|-----|---------------|
+| `generate_custom_voice()` | `custom_voice` |
+| `generate_voice_clone()` | `base` |
+| `generate_voice_design()` | `voice_design` |
+
+`Qwen3-TTS-12Hz-0.6B-Base` reports `tts_model_type: base`. Our HF baseline path called
+`generate_custom_voice()` unconditionally → instant `ValueError`.
+
+**Root cause of confusion:** the model type naming is counterintuitive — "Base" sounds generic but maps to
+the voice-cloning variant of the API, not a plain TTS call.
+
+**Fix:** In `_stream_hf()` (`server/qwen_tts_engine.py`), detect `tts_model_type` at runtime and dispatch:
+
+```python
+tts_model_type = getattr(getattr(model, "model", None), "tts_model_type", "custom_voice")
+
+if tts_model_type == "base":
+    # Base model: generate_voice_clone() with x_vector_only_mode=True.
+    # Synthetic noise clip used as reference — extracts a random speaker embedding.
+    ref_audio = (np.random.randn(24000).astype(np.float32) * 0.05, 24000)
+    audio_list, sr = model.generate_voice_clone(
+        text=text,
+        language="English",
+        ref_audio=ref_audio,
+        x_vector_only_mode=True,
+    )
+else:
+    audio_list, sr = model.generate_custom_voice(
+        text=text,
+        language="English",
+        speaker="default",
+    )
+```
+
+`x_vector_only_mode=True` tells the model to use only the speaker embedding (x-vector) from the reference
+audio and ignore any reference codes. The synthetic noise clip yields a noisy/random speaker identity,
+which is acceptable for the fallback path — the output is intelligible, just not a specific voice.
+
+**Note:** This fix is only needed when the megakernel path fails. Normally `start.sh` ensures
+`PYTHONPATH` is set and the megakernel path loads successfully, bypassing the HF baseline entirely.
+
+**Lesson:** Always check the vendor API docs / source for model-type guards before calling a generation
+method. The `tts_model_type` attribute lives on `model.model` (the inner `Qwen3TTSForConditionalGeneration`),
+not on the `Qwen3TTSModel` wrapper.

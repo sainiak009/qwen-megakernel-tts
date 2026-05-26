@@ -213,20 +213,44 @@ class QwenTTSEngine:
     async def _stream_hf(self, text: str) -> AsyncGenerator[bytes, None]:
         """
         qwen-tts path: generate complete audio then yield in PCM chunks.
-        Uses Qwen3TTSModel.generate_custom_voice() with a default speaker.
+
+        Dispatches based on tts_model_type:
+          - "base"         → generate_voice_clone() (Base model, requires ref audio;
+                             uses x_vector_only_mode=True with synthetic noise clip)
+          - "custom_voice" → generate_custom_voice() with a default speaker
         """
         loop = asyncio.get_event_loop()
         model = self._hf_model
         chunk_size = self.chunk_codes * 2000  # ~chunk_codes codec frames worth of samples
 
         def _run():
-            audio_list, sr = model.generate_custom_voice(
-                text=text,
-                language="English",
-                speaker="default",
-            )
+            inner_model = getattr(model, "model", None)
+            tts_model_type = getattr(inner_model, "tts_model_type", "custom_voice")
+
+            if tts_model_type == "base":
+                # Base model uses voice-clone API.  We don't have a reference speaker,
+                # so pass a short synthetic noise clip with x_vector_only_mode=True.
+                # This extracts a (random) speaker embedding and ignores ref_code,
+                # giving intelligible but unspecified-speaker output.
+                ref_audio = (np.random.randn(24000).astype(np.float32) * 0.05, 24000)
+                audio_list, sr = model.generate_voice_clone(
+                    text=text,
+                    language="English",
+                    ref_audio=ref_audio,
+                    x_vector_only_mode=True,
+                )
+            else:
+                audio_list, sr = model.generate_custom_voice(
+                    text=text,
+                    language="English",
+                    speaker="default",
+                )
+
             if isinstance(audio_list, (list, tuple)):
-                audio = np.concatenate([np.array(a, dtype=np.float32).squeeze() for a in audio_list if len(a) > 0])
+                audio = np.concatenate([
+                    np.array(a, dtype=np.float32).squeeze()
+                    for a in audio_list if np.asarray(a).size > 0
+                ])
             else:
                 audio = np.array(audio_list, dtype=np.float32).squeeze()
             return audio, sr
