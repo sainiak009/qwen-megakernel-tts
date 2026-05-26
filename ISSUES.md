@@ -188,3 +188,35 @@ else:
 **Also discovered in same session:** No text projection layer exists in the talker's non-layer weights (`norm.weight`, `codec_embedding.weight`, `text_embedding.weight` — that's all). The `text_embedding` is 2048-dim with no 2048→1024 linear anywhere in the talker. This strongly suggests the talker **does not take raw text tokens** — it receives hidden states from the thinker model (which likely has hidden_size=2048). Text prefill by feeding raw token IDs through the talker backbone is architecturally incorrect. A different prefill strategy is needed (run thinker first, pass its output as KV-cache seed).
 
 **Lesson:** Check `.config` on the inner `nn.Module`, not on the vendor wrapper class. When no projection is found between embedding dim and hidden dim, the embedding is not meant to feed that transformer directly.
+
+---
+
+## Issue #6 — Empty WAV (44 bytes) — megakernel generates zero audio codes
+
+**Symptom:** Server returns HTTP 200 with a valid WAV container but only 44 bytes (header only, zero audio frames).
+
+**Root cause (two layers):**
+
+**Layer 1 — Bad text prefill:** The talker's `text_embedding` is [151936, 2048] but the transformer backbone expects 1024-dim input. No projection layer exists in the talker's non-layer weights, confirming the talker **does not take raw text tokens directly**. The talker receives hidden states from the thinker model (which has hidden_size=2048). Feeding truncated 2048→1024 text embeddings into the talker backbone produces garbage hidden states → the first predicted audio token is EOS (id=2150) → zero codes generated → empty WAV.
+
+**Layer 2 — Missing code predictor step:** The codec requires all codebooks to decode to audio. The `code_predictor` module generates codebooks 2–15 from the first-codebook output of the talker backbone (seen as `talker.code_predictor.model.codec_embedding.{0-14}.weight [2048, 1024]`). Our `_decode_codes_to_audio()` was trying to decode only first-codebook codes directly via `speech_tokenizer.decode(tensor)` — both wrong format and missing codebooks.
+
+**Fix needed:**
+1. Fix text prefill — either run the thinker first and pass its hidden states as KV-cache seed, or start from a learned audio BOS token
+2. After megakernel generates first-codebook codes, run them through `code_predictor` to get all codebooks, then decode via speech tokenizer
+3. Fix `speech_tokenizer.decode()` call — expects a dict, not a raw tensor (exact format TBD, need to inspect source)
+
+---
+
+## Issue #7 — `speech_tokenizer.decode()` expects dict, not tensor
+
+**Error:**
+```
+File "qwen_tts/inference/qwen3_tts_tokenizer.py", line 313, in decode
+    raise TypeError("`encoded` must be an encode output, a dict, or a list of dicts.")
+TypeError: `encoded` must be an encode output, a dict, or a list of dicts.
+```
+
+**Cause:** Our `_decode_codes_to_audio()` passed a raw `torch.Tensor` to `speech_tokenizer.decode()`. The qwen-tts speech tokenizer expects either the output of its own `encode()` method (a dict), a dict directly, or a list of dicts. Exact key format TBD — need to inspect `qwen3_tts_tokenizer.py` decode signature on the instance.
+
+**Status:** Pending — need to read speech tokenizer source to determine correct call format.
