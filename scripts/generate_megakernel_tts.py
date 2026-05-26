@@ -48,8 +48,9 @@ HIDDEN_SIZE       = 1024
 INTERMEDIATE_SIZE = 3072
 Q_SIZE            = NUM_Q_HEADS * HEAD_DIM   # 2048
 KV_SIZE           = NUM_KV_HEADS * HEAD_DIM  # 1024
-KERNEL_VOCAB_SIZE = 151936   # hardcoded in kernel.cu — we pad our LM head to this
-TTS_AUDIO_VOCAB   = 3072     # Qwen3-TTS talker audio codebook size
+KERNEL_VOCAB_SIZE = 3072     # kernel LDG_VOCAB_SIZE patched to 3072 (TTS audio vocab);
+                             # argmax now scans 6.3 MB instead of 311 MB — saves ~180 µs/step
+TTS_AUDIO_VOCAB   = 3072     # Qwen3-TTS talker audio codebook size (== KERNEL_VOCAB_SIZE)
 TTS_ROPE_THETA    = 1_000_000.0
 TTS_MAX_SEQ_LEN   = 4096     # increased from 2048
 
@@ -179,12 +180,9 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
     if audio_lm_head is None:
         raise RuntimeError("Could not find codec_head weight [3072, 1024]")
 
-    # Pad to [KERNEL_VOCAB_SIZE, HIDDEN_SIZE] — zeros for rows 3072..151935
-    padded_lm_head = torch.zeros(
-        KERNEL_VOCAB_SIZE, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
-    )
-    padded_lm_head[:TTS_AUDIO_VOCAB] = audio_lm_head
-    padded_lm_head = padded_lm_head.contiguous()
+    # KERNEL_VOCAB_SIZE == TTS_AUDIO_VOCAB == 3072 — no zero-padding needed;
+    # kernel LDG_VOCAB_SIZE patched to 3072 so argmax only reads these rows.
+    padded_lm_head = audio_lm_head[:KERNEL_VOCAB_SIZE].contiguous()
 
     # ── 5. Config values ──────────────────────────────────────────────────────
     cfg = getattr(inner, "config", None) or getattr(model, "config", None)

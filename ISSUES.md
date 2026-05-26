@@ -378,3 +378,64 @@ This produces exactly 3 role-prefix tokens + N text-body tokens + 5 trailing tok
 **Lesson:** The talker backbone does not accept plain text tokens — it requires a chat-formatted sequence
 where codec tag embeddings are **summed** with TTS special token projections. This conditioning pattern
 is only visible by reading `modeling_qwen3_tts.py` line 2124–2232 in full.
+
+---
+
+## Perf #1 — LM head argmax scans 151,936 rows; TTS only needs 3,072
+
+**Classification:** Performance improvement (Bonus). Not a bug — output was correct, but wasteful.
+
+**Problem:** The kernel's LM head argmax (`ldg_lm_head_fused`) scanned the full text vocabulary
+(151,936 rows × 1,024 dims = **311 MB**) on every single decode step. For the TTS talker, rows
+3,072–151,935 are all zeros (we padded with zeros in Python to match the kernel's expected vocab size).
+The argmax always came from the first 3,072 rows — the remaining 308 MB of zeros were read for nothing.
+
+**Measured cost of the waste (from blog data):**
+- LM head argmax = 26.1% of total memory bandwidth per step
+- Total per-step memory: ~1,192 MB; LM head alone: 311 MB
+- At GDDR7 1,674 GB/s: ~186 µs per step spent on LM head alone
+- With 3,072 rows: 6.3 MB → ~3.8 µs → **savings ≈ 182 µs/step (~18% speedup)**
+- Projected throughput: ~1,033 tok/s → ~1,260 tok/s
+
+**Fix — two files:**
+
+**1. `qwen_megakernel/csrc/kernel.cu` (on instance, one line):**
+```c
+// Before:
+constexpr int LDG_VOCAB_SIZE = 151936;
+
+// After:
+constexpr int LDG_VOCAB_SIZE = 3072; // TTS: audio vocab only; saves ~180µs/step
+```
+
+**2. `qwen_megakernel/qwen_megakernel/build.py` (on instance, one line):**
+```python
+# Before:
+f"-DLDG_LM_NUM_BLOCKS={_env_int('LDG_LM_NUM_BLOCKS', 1280)}",
+
+# After:
+f"-DLDG_LM_NUM_BLOCKS={_env_int('LDG_LM_NUM_BLOCKS', 24)}",
+```
+Rationale: 3,072 rows / ~128 rows-per-block = 24 blocks. Original 1,280 blocks was sized for
+151,936 rows. Excess blocks now do no work (row_start ≥ row_end → they skip immediately).
+Using 24 blocks avoids launching 1,256 idle blocks.
+
+**3. `scripts/generate_megakernel_tts.py` (Python, two changes):**
+```python
+# KERNEL_VOCAB_SIZE: 151936 → 3072 (no more 305 MB zero-padding allocation)
+KERNEL_VOCAB_SIZE = 3072
+
+# padded_lm_head: was torch.zeros(151936, 1024) + copy; now just a slice
+padded_lm_head = audio_lm_head[:KERNEL_VOCAB_SIZE].contiguous()
+```
+**Side effect:** Reduces GPU memory by ~305 MB (eliminates the zero-padding allocation).
+
+**Note on build system:** `build.py` uses `torch.utils.cpp_extension.load` JIT compilation.
+`LDG_LM_NUM_BLOCKS` is passed as a `-D` compile flag from `build.py`, overriding the `#define`
+in `kernel.cu`. `LDG_VOCAB_SIZE` is a `constexpr` (not `#define`) and is not in build.py's
+flag list, so it must be patched directly in `kernel.cu`. JIT cache must be cleared after
+kernel changes: `rm -rf ~/.cache/torch_extensions/py312_cu128/qwen_megakernel_C*`.
+
+**Lesson:** When porting a general-purpose LM kernel to a domain-specific model, check whether
+the LM head vocab size can be reduced. The TTS audio vocab is 50× smaller than the text vocab —
+all gains are free (no model quality impact).
