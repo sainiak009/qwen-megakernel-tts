@@ -143,7 +143,13 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
             print(f"  Final norm (fallback): {norm_key}")
     final_norm = sd[norm_key].contiguous()
 
+    # ── Diagnostic: print all embed-related keys so we know what's actually there
+    if verbose:
+        embed_keys = [(k, list(v.shape)) for k, v in sd.items() if "embed" in k.lower()]
+        print(f"  Embed keys in state dict: {embed_keys}")
+
     # ── 3. Audio embed_tokens (talker's own embed, vocab=3072) ───────────────
+    # Try exact match first; fall back to first 3072 rows of a larger embed under talker prefix
     audio_embed = None
     for k, v in sd.items():
         if "embed_tokens" in k and v.shape[0] == TTS_AUDIO_VOCAB:
@@ -152,7 +158,19 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
                 print(f"  Audio embed_tokens: {k}  {list(v.shape)}")
             break
     if audio_embed is None:
-        raise RuntimeError("Could not find talker audio embed_tokens (expected shape [3072, 1024])")
+        # Talker may share one embed table for both text and audio tokens.
+        # Slice first TTS_AUDIO_VOCAB rows as the audio embed.
+        for k, v in sd.items():
+            if "embed_tokens" in k and prefix in k and v.shape[0] >= TTS_AUDIO_VOCAB:
+                audio_embed = v[:TTS_AUDIO_VOCAB].contiguous()
+                if verbose:
+                    print(f"  Audio embed_tokens (sliced [:3072] from {k}  {list(v.shape)})")
+                break
+    if audio_embed is None:
+        raise RuntimeError(
+            f"Could not find talker audio embed_tokens. "
+            f"Embed keys found: {[(k, list(v.shape)) for k, v in sd.items() if 'embed' in k.lower()]}"
+        )
 
     # ── 4. Text embed_tokens (151936×1024, for prefill via step()) ───────────
     text_embed = None
@@ -163,9 +181,16 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
                 print(f"  Text embed_tokens:  {k}  {list(v.shape)}")
             break
     if text_embed is None:
-        # Attempt: use the talker's text_embed or fallback to same as audio
+        # Use the talker's embed table for text prefill as well (same weights)
+        for k, v in sd.items():
+            if "embed_tokens" in k and prefix in k:
+                text_embed = v.contiguous()
+                if verbose:
+                    print(f"  Text embed_tokens (using full {k}  {list(v.shape)} for prefill)")
+                break
+    if text_embed is None:
         if verbose:
-            print("  Warning: could not find 151936-row embed_tokens; text prefill uses audio embed")
+            print("  Warning: could not find embed_tokens for text prefill; using audio embed")
         text_embed = audio_embed
 
     # ── 5. Audio LM head (codec_head) padded to kernel's VOCAB_SIZE ──────────
