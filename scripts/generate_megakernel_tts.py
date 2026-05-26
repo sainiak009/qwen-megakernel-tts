@@ -242,14 +242,24 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
 
     # ── 6. Speech tokenizer for audio decoding ───────────────────────────────
     speech_tokenizer = None
-    if hasattr(model, "model") and hasattr(model.model, "speech_tokenizer"):
-        speech_tokenizer = model.model.speech_tokenizer
+    if hasattr(inner, "speech_tokenizer"):
+        speech_tokenizer = inner.speech_tokenizer
     elif hasattr(model, "speech_tokenizer"):
         speech_tokenizer = model.speech_tokenizer
 
     # ── 7. EOS token ID for audio generation ─────────────────────────────────
-    codec_eos_id = getattr(model.config, "codec_eos_token_id",
-                   getattr(getattr(model.config, "talker_config", model.config), "codec_eos_token_id", 2048))
+    # Qwen3TTSModel wrapper has no .config — use inner model's config
+    cfg = getattr(inner, "config", None) or getattr(model, "config", None)
+    if cfg is not None:
+        talker_cfg = getattr(cfg, "talker_config", cfg)
+        codec_eos_id = getattr(talker_cfg, "codec_eos_token_id",
+                       getattr(cfg, "codec_eos_token_id", 2048))
+    else:
+        codec_eos_id = 2048
+        if verbose:
+            print("  Warning: could not find config; using codec_eos_id=2048")
+    if verbose:
+        print(f"  codec_eos_id = {codec_eos_id}")
 
     del model
     torch.cuda.empty_cache()
