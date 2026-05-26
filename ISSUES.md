@@ -143,4 +143,21 @@ for k, v in sd.items():
 
 Similarly, the text prefill path now falls back to using the full talker embed table if no 151936-row embed is found separately.
 
-**Lesson:** Don't assume a TTS model stores separate embedding tables for text and audio. Inspect the actual state dict keys and shapes before writing the weight extraction logic.
+**Actual state dict revealed** (from diagnostic output on instance):
+```
+talker.model.codec_embedding.weight   [3072, 1024]    ← audio embed (correct shape)
+talker.model.text_embedding.weight    [151936, 2048]  ← text embed (2048-dim, NOT 1024!)
+talker.code_predictor.model.codec_embedding.{0-14}.weight  [2048, 1024]  ← codebook generator (not our concern)
+```
+
+Two sub-issues discovered:
+1. Key names are `codec_embedding` / `text_embedding`, NOT `embed_tokens`
+2. `text_embedding` has hidden dim **2048**, but the talker transformer expects **1024** — a projection layer must exist somewhere
+
+**Updated fix:**
+- Audio embed: search for `codec_embedding` key with shape [3072, 1024] ✓
+- Text embed: find `text_embedding` [151936, 2048], then search for a projection weight [2048→1024] under the talker prefix to bring it down to HIDDEN_SIZE before use
+- Added diagnostic print of all non-layer talker keys so projection weight name becomes visible in logs
+- Fallback: if no projection found, truncate text_embedding to [:, :1024] as last resort
+
+**Lesson:** Don't assume a TTS model stores separate embedding tables for text and audio, or that embedding dims match the transformer hidden size. Always inspect actual state dict key names and shapes first.
