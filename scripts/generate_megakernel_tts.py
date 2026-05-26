@@ -11,11 +11,19 @@ Architecture adaptation (see inspect_qwen_tts.py for full comparison):
   ─ Audio LM head: codec_head [3072,1024] padded to [151936,1024] with zeros
       → kernel's argmax returns correct audio code ID (0..3071) as long
         as at least one audio logit > 0, which holds for a trained model
-  ─ Embedding swap: text embed during prefill, audio embed during decode
+  ─ Arbitrary-embed trick: pass token_id=0 with a 1-row temp table to feed
+      a precomputed 1024-dim vector to the kernel without kernel modifications
+
+Per-step computation (fully matches qwen-tts generate() flow):
+  1. codec_embed = audio_embed[first_code]           [1024]
+  2. residual_codes = code_predictor.generate(codec_embed)  → 15 residual codes
+  3. step_embed = codec_embed + Σ predictor_embeds[i](residual_codes[i])
+  4. step_embed += trailing_text_hidden[decode_step]   # text conditioning
+  5. megakernel(_step_with_embed(step_embed)) → next first_code
 
 NOT modified:
   ─ kernel.cu / csrc — not a single byte changed
-  ─ code_predictor (codebook generator) — runs in PyTorch, untouched
+  ─ code_predictor weights — called as-is from qwen-tts
 
 Usage (requires RTX 5090 + CUDA 12.8 + qwen_megakernel installed):
     python scripts/generate_megakernel_tts.py
@@ -87,8 +95,11 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
     """
     Load Qwen3-TTS talker weights and remap to megakernel layout.
 
-    Returns weights dict compatible with the megakernel Decoder constructor,
-    plus the speech_tokenizer for audio decoding.
+    Returns a weights dict with:
+      - Backbone tensors (layer_weights, final_norm, padded_lm_head, audio_embed)
+        copied to contiguous CUDA tensors for the kernel.
+      - talker_module: the nn.Module for text_projection + code_predictor access.
+        Thinker and other heavy modules are released to free VRAM.
     """
     from qwen_tts import Qwen3TTSModel
 
@@ -131,23 +142,16 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
         ])
 
     # ── 2. Final norm ─────────────────────────────────────────────────────────
-    # prefix is e.g. 'talker.model.' (everything before 'layers.0.*')
-    # The final LayerNorm sits at '{prefix}norm.weight'
     norm_key = f"{prefix}norm.weight"
     if norm_key not in sd:
-        candidates = [k for k in sd if k.endswith("norm.weight") and "layers" not in k]
+        candidates = [k for k in sd if k.endswith("norm.weight") and "layers" not in k
+                      and k.startswith(prefix)]
         if not candidates:
-            raise RuntimeError(f"Cannot find final norm. Tried '{norm_key}'. All norm keys: {[k for k in sd if 'norm' in k][:8]}")
+            raise RuntimeError(f"Cannot find final norm. Tried '{norm_key}'.")
         norm_key = candidates[0]
         if verbose:
             print(f"  Final norm (fallback): {norm_key}")
     final_norm = sd[norm_key].contiguous()
-
-    # ── Diagnostic: print all non-layer talker keys to find projection weights
-    if verbose:
-        talker_top_keys = [(k, list(v.shape)) for k, v in sd.items()
-                           if k.startswith(prefix) and "layers." not in k]
-        print(f"  Talker non-layer keys: {talker_top_keys}")
 
     # ── 3. Audio embed: talker.model.codec_embedding.weight [3072, 1024] ─────
     audio_embed = None
@@ -158,270 +162,294 @@ def load_tts_weights(model_id: str = MODEL_ID, verbose: bool = True):
                 print(f"  Audio embed: {k}  {list(v.shape)}")
             break
     if audio_embed is None:
-        # Fallback: any embed under talker prefix with [3072, 1024]
-        for k, v in sd.items():
-            if prefix in k and len(v.shape) == 2 and v.shape == (TTS_AUDIO_VOCAB, HIDDEN_SIZE):
-                audio_embed = v.contiguous()
-                if verbose:
-                    print(f"  Audio embed (fallback): {k}  {list(v.shape)}")
-                break
-    if audio_embed is None:
         raise RuntimeError(
             f"Could not find audio embed [3072, 1024]. "
-            f"Talker non-layer keys: {[(k, list(v.shape)) for k, v in sd.items() if k.startswith(prefix) and 'layers.' not in k]}"
+            f"Talker keys: {[(k, list(v.shape)) for k,v in sd.items() if k.startswith(prefix) and 'layers.' not in k]}"
         )
 
-    # ── 4. Text embed + optional projection to HIDDEN_SIZE ───────────────────
-    # talker.model.text_embedding.weight is [151936, 2048] — needs projection to 1024.
-    # Look for a text_proj linear (2048→1024) under the talker prefix.
-    text_embed_raw = None
-    text_proj = None
-    for k, v in sd.items():
-        if "text_embedding" in k and prefix in k and v.shape[0] == KERNEL_VOCAB_SIZE:
-            text_embed_raw = v.contiguous()
-            if verbose:
-                print(f"  Text embed raw: {k}  {list(v.shape)}")
-            break
-    if text_embed_raw is not None and text_embed_raw.shape[1] != HIDDEN_SIZE:
-        # Look for a projection weight that maps text_embed dim → HIDDEN_SIZE
-        text_dim = text_embed_raw.shape[1]
-        for k, v in sd.items():
-            if prefix in k and "layers." not in k and len(v.shape) == 2:
-                if v.shape == (HIDDEN_SIZE, text_dim) or v.shape == (text_dim, HIDDEN_SIZE):
-                    text_proj = v.contiguous()
-                    if verbose:
-                        print(f"  Text projection: {k}  {list(v.shape)}")
-                    break
-
-    # Build final text_embed: project down to HIDDEN_SIZE if needed
-    if text_embed_raw is not None:
-        if text_proj is not None:
-            # Project: [151936, text_dim] @ [text_dim, 1024] → [151936, 1024]
-            w = text_proj if text_proj.shape[0] == HIDDEN_SIZE else text_proj.T
-            text_embed = (text_embed_raw.float() @ w.float().T).to(torch.bfloat16).contiguous()
-            if verbose:
-                print(f"  Text embed projected: {list(text_embed.shape)}")
-        elif text_embed_raw.shape[1] == HIDDEN_SIZE:
-            text_embed = text_embed_raw
-        else:
-            # Dimension mismatch and no projection found — truncate as last resort
-            if verbose:
-                print(f"  Warning: text embed dim {text_embed_raw.shape[1]} != {HIDDEN_SIZE}, truncating")
-            text_embed = text_embed_raw[:, :HIDDEN_SIZE].contiguous()
-    else:
-        if verbose:
-            print("  Warning: no text_embedding found; text prefill uses audio embed")
-        text_embed = audio_embed
-
-    # ── 5. Audio LM head (codec_head) padded to kernel's VOCAB_SIZE ──────────
+    # ── 4. Audio LM head (codec_head) padded to kernel's VOCAB_SIZE ──────────
     audio_lm_head = None
     for k, v in sd.items():
         if "codec_head" in k and len(v.shape) == 2:
             audio_lm_head = v.contiguous()
             if verbose:
-                print(f"  codec_head:         {k}  {list(v.shape)}")
+                print(f"  codec_head: {k}  {list(v.shape)}")
             break
-    if audio_lm_head is None:
-        # Fallback: find any linear weight with correct output dim
-        for k, v in sd.items():
-            if len(v.shape) == 2 and v.shape[0] == TTS_AUDIO_VOCAB and v.shape[1] == HIDDEN_SIZE:
-                audio_lm_head = v.contiguous()
-                if verbose:
-                    print(f"  lm_head (fallback): {k}  {list(v.shape)}")
-                break
     if audio_lm_head is None:
         raise RuntimeError("Could not find codec_head weight [3072, 1024]")
 
     # Pad to [KERNEL_VOCAB_SIZE, HIDDEN_SIZE] — zeros for rows 3072..151935
-    # Argmax picks correct audio code as long as ≥1 audio logit > 0
     padded_lm_head = torch.zeros(
         KERNEL_VOCAB_SIZE, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
     )
     padded_lm_head[:TTS_AUDIO_VOCAB] = audio_lm_head
     padded_lm_head = padded_lm_head.contiguous()
 
-    # ── 6. Speech tokenizer for audio decoding ───────────────────────────────
-    speech_tokenizer = None
-    if hasattr(inner, "speech_tokenizer"):
-        speech_tokenizer = inner.speech_tokenizer
-    elif hasattr(model, "speech_tokenizer"):
-        speech_tokenizer = model.speech_tokenizer
-
-    # ── 7. EOS token ID for audio generation ─────────────────────────────────
-    # Qwen3TTSModel wrapper has no .config — use inner model's config
+    # ── 5. Config values ──────────────────────────────────────────────────────
     cfg = getattr(inner, "config", None) or getattr(model, "config", None)
-    if cfg is not None:
-        talker_cfg = getattr(cfg, "talker_config", cfg)
-        codec_eos_id = getattr(talker_cfg, "codec_eos_token_id",
-                       getattr(cfg, "codec_eos_token_id", 2048))
-    else:
-        codec_eos_id = 2048
-        if verbose:
-            print("  Warning: could not find config; using codec_eos_id=2048")
+    talker_cfg = getattr(cfg, "talker_config", cfg) if cfg else None
+    codec_eos_id    = getattr(talker_cfg, "codec_eos_token_id", 2150) if talker_cfg else 2150
+    codec_bos_id    = getattr(talker_cfg, "codec_bos_id",       2149) if talker_cfg else 2149
+    num_code_groups = getattr(talker_cfg, "num_code_groups",      16) if talker_cfg else 16
     if verbose:
-        print(f"  codec_eos_id = {codec_eos_id}")
+        print(f"  codec_eos_id={codec_eos_id}  codec_bos_id={codec_bos_id}  num_code_groups={num_code_groups}")
+
+    # ── 6. Keep talker module alive; release rest to free VRAM ───────────────
+    # talker_module carries: text_projection, code_predictor, model.text_embedding
+    # speech_tokenizer lives on inner, not on talker directly
+    talker_module    = getattr(inner, "talker", None)
+    speech_tokenizer = getattr(inner, "speech_tokenizer", None) or getattr(model, "speech_tokenizer", None)
 
     del model
+    del inner
     torch.cuda.empty_cache()
 
-    weights = {
-        "audio_embed": audio_embed,
-        "text_embed": text_embed,
-        "layer_weights": layer_weights,
-        "final_norm_weight": final_norm,
-        "padded_lm_head": padded_lm_head,
-        "codec_eos_id": codec_eos_id,
-        "speech_tokenizer": speech_tokenizer,
-    }
     if verbose:
-        print(f"  codec_eos_id = {codec_eos_id}")
         print("  All weights loaded and remapped.")
-    return weights
+
+    return {
+        "audio_embed":       audio_embed,
+        "layer_weights":     layer_weights,
+        "final_norm_weight": final_norm,
+        "padded_lm_head":    padded_lm_head,
+        "codec_eos_id":      codec_eos_id,
+        "codec_bos_id":      codec_bos_id,
+        "num_code_groups":   num_code_groups,
+        "talker_module":     talker_module,
+        "speech_tokenizer":  speech_tokenizer,
+    }
 
 
 class TalkerDecoder:
     """
     Megakernel-backed Qwen3-TTS talker decoder.
 
-    Backbone: 28 transformer layers run via megakernel CUDA op (unchanged).
-    Embedding: swappable — text embed for prefill, audio embed for decode.
-    LM head:   padded codec_head [3072→151936], argmax returns audio code ID.
-    RoPE:      recomputed with theta=1_000_000.
-    KV cache:  4096 positions.
+    Backbone: 28 transformer layers via megakernel CUDA op (unchanged).
+    Per-step: codec_embed + code_predictor residuals + trailing_text_hidden
+              → summed 1024-dim vector → kernel via 1-row temp embed table trick.
+    LM head:  padded codec_head [3072→151936], argmax = audio code ID.
+    RoPE:     recomputed with theta=1_000_000 (vs 10_000 in base model).
+    KV cache: 4096 positions (vs 2048 in stock kernel).
     """
 
     def __init__(self, weights: dict | None = None, model_id: str = MODEL_ID, verbose: bool = True):
         try:
-            import qwen_megakernel  # triggers JIT build of CUDA extension
-            self._decode      = torch.ops.qwen_megakernel_C.decode
-            self._gen_nosync  = torch.ops.qwen_megakernel_C.generate_nosync
+            import qwen_megakernel
+            self._decode     = torch.ops.qwen_megakernel_C.decode
+            self._gen_nosync = torch.ops.qwen_megakernel_C.generate_nosync
         except ImportError as e:
             raise RuntimeError(
-                "qwen_megakernel not installed. "
-                "Run: pip install git+https://github.com/AlpinDale/qwen_megakernel"
+                "qwen_megakernel not installed. Clone from github.com/AlpinDale/qwen_megakernel "
+                "and add to PYTHONPATH."
             ) from e
 
         if weights is None:
             weights = load_tts_weights(model_id, verbose=verbose)
-        self._weights = weights
 
+        # ── Megakernel tensors ────────────────────────────────────────────────
         self._audio_embed  = weights["audio_embed"]
-        self._text_embed   = weights["text_embed"]
+        self._embed_weight = self._audio_embed   # always audio during decode
         self._lm_head      = weights["padded_lm_head"]
         self._final_norm   = weights["final_norm_weight"]
-        self.codec_eos_id  = weights["codec_eos_id"]
-        self.speech_tokenizer = weights["speech_tokenizer"]
-
-        # Start with audio embed (will swap during prefill if text_embed differs)
-        self._embed_weight = self._audio_embed
 
         self._layer_weights_packed = _pack_layer_weights(weights["layer_weights"])
         self._attn_scale = 1.0 / math.sqrt(HEAD_DIM)
-        self._position    = 0
+        self._position   = 0
 
-        # RoPE tables with TTS theta
         self._cos_table, self._sin_table = _compute_rope_tables(TTS_MAX_SEQ_LEN, TTS_ROPE_THETA)
 
-        # KV cache (larger than stock megakernel's 2048)
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
-        f32  = dict(dtype=torch.float32, device="cuda")
-        self._k_cache = torch.zeros(NUM_LAYERS, NUM_KV_HEADS, TTS_MAX_SEQ_LEN, HEAD_DIM, **bf16)
-        self._v_cache = torch.zeros_like(self._k_cache)
-
-        # Scratch buffers
-        self._hidden    = torch.empty(HIDDEN_SIZE, **bf16)
-        self._act       = torch.empty(HIDDEN_SIZE, **f32)
-        self._res       = torch.empty(HIDDEN_SIZE, **f32)
-        self._q         = torch.empty(Q_SIZE,      **f32)
-        self._k         = torch.empty(KV_SIZE,     **f32)
-        self._v         = torch.empty(KV_SIZE,     **f32)
-        self._attn_out  = torch.empty(Q_SIZE,      **f32)
+        f32  = dict(dtype=torch.float32,  device="cuda")
+        self._k_cache   = torch.zeros(NUM_LAYERS, NUM_KV_HEADS, TTS_MAX_SEQ_LEN, HEAD_DIM, **bf16)
+        self._v_cache   = torch.zeros_like(self._k_cache)
+        self._hidden    = torch.empty(HIDDEN_SIZE,       **bf16)
+        self._act       = torch.empty(HIDDEN_SIZE,       **f32)
+        self._res       = torch.empty(HIDDEN_SIZE,       **f32)
+        self._q         = torch.empty(Q_SIZE,            **f32)
+        self._k         = torch.empty(KV_SIZE,           **f32)
+        self._v         = torch.empty(KV_SIZE,           **f32)
+        self._attn_out  = torch.empty(Q_SIZE,            **f32)
         self._mlp_inter = torch.empty(INTERMEDIATE_SIZE, **f32)
-        self._norm_out  = torch.empty(HIDDEN_SIZE, **f32)
-        self._bmax_vals = torch.empty(4096,         **f32)
+        self._norm_out  = torch.empty(HIDDEN_SIZE,       **f32)
+        self._bmax_vals = torch.empty(4096,              **f32)
         self._bmax_idxs = torch.empty(4096, dtype=torch.int32, device="cuda")
-        self._out_token = torch.empty(1, dtype=torch.int32, device="cuda")
+        self._out_token = torch.empty(1,    dtype=torch.int32, device="cuda")
+
+        # ── qwen-tts components (kept alive from talker_module) ───────────────
+        talker = weights.get("talker_module")
+        self._text_projection = getattr(talker, "text_projection", None) if talker else None
+        self._code_predictor  = getattr(talker, "code_predictor",  None) if talker else None
+        # text_embedding lives at talker.model.text_embedding (2048-dim)
+        self._text_embed_raw  = (
+            talker.model.text_embedding.weight
+            if talker and hasattr(talker, "model") and hasattr(talker.model, "text_embedding")
+            else None
+        )
+
+        self.codec_eos_id    = weights["codec_eos_id"]
+        self.codec_bos_id    = weights.get("codec_bos_id", 2149)
+        self._num_residual   = weights.get("num_code_groups", 16) - 1   # 15
+        self.speech_tokenizer = weights["speech_tokenizer"]
+
+        # Per-generation state — reset in reset()
+        self._trailing_text_hidden: torch.Tensor | None = None
+        self._decode_step = 0
+
+    # ── Core kernel calls ─────────────────────────────────────────────────────
 
     def reset(self):
         self._position = 0
+        self._decode_step = 0
+        self._trailing_text_hidden = None
         self._k_cache.zero_()
         self._v_cache.zero_()
 
     def _step(self, token_id: int) -> int:
-        """Single-token decode. Returns next token id."""
+        """Single-token decode using embed table lookup (for direct benchmarking)."""
         self._decode(
-            self._out_token,
-            token_id,
-            self._embed_weight,
-            self._layer_weights_packed,
-            self._final_norm,
-            self._lm_head,
-            self._cos_table,
-            self._sin_table,
-            self._k_cache,
-            self._v_cache,
-            self._hidden,
-            self._act,
-            self._res,
-            self._q,
-            self._k,
-            self._v,
-            self._attn_out,
-            self._mlp_inter,
-            self._norm_out,
-            self._bmax_vals,
-            self._bmax_idxs,
-            NUM_LAYERS,
-            self._position,
-            TTS_MAX_SEQ_LEN,
-            self._attn_scale,
+            self._out_token, token_id, self._embed_weight,
+            self._layer_weights_packed, self._final_norm, self._lm_head,
+            self._cos_table, self._sin_table, self._k_cache, self._v_cache,
+            self._hidden, self._act, self._res, self._q, self._k, self._v,
+            self._attn_out, self._mlp_inter, self._norm_out,
+            self._bmax_vals, self._bmax_idxs,
+            NUM_LAYERS, self._position, TTS_MAX_SEQ_LEN, self._attn_scale,
         )
         self._position += 1
         return self._out_token.item()
 
+    def _step_with_embed(self, embed: torch.Tensor) -> int:
+        """
+        Single-token decode with a precomputed 1024-dim embedding vector.
+
+        Trick: pass token_id=0 and a 1-row embed table containing our vector.
+        The kernel does embed = table[token_id] = table[0] = our embed.
+        No kernel modifications needed.
+        """
+        temp_table = embed.to(torch.bfloat16).unsqueeze(0).contiguous()
+        self._decode(
+            self._out_token, 0, temp_table,
+            self._layer_weights_packed, self._final_norm, self._lm_head,
+            self._cos_table, self._sin_table, self._k_cache, self._v_cache,
+            self._hidden, self._act, self._res, self._q, self._k, self._v,
+            self._attn_out, self._mlp_inter, self._norm_out,
+            self._bmax_vals, self._bmax_idxs,
+            NUM_LAYERS, self._position, TTS_MAX_SEQ_LEN, self._attn_scale,
+        )
+        self._position += 1
+        return self._out_token.item()
+
+    # ── Text prefill ──────────────────────────────────────────────────────────
+
     def prefill_text(self, text_token_ids: list[int]) -> int:
         """
-        Run text tokens through the backbone using text embeddings.
-        Returns the first audio code token ID predicted after prefill.
-        """
-        # Use text embeddings for prefill phase
-        self._embed_weight = self._text_embed
-        for tid in text_token_ids[:-1]:
-            self._step(tid)
-        first_code = self._step(text_token_ids[-1])
-        # Switch to audio embeddings for generation phase
-        self._embed_weight = self._audio_embed
-        return first_code
+        Prefill the backbone with projected text embeddings.
 
-    def generate_audio_codes(
-        self,
-        first_code: int,
-        max_tokens: int = 1024,
-    ) -> list[int]:
+        Uses talker.text_projection(talker.model.text_embedding(ids)) to get
+        1024-dim vectors, stores them as trailing_text_hidden for per-step
+        conditioning during decode, then runs them through the backbone.
+
+        Returns the first audio code predicted after prefill.
         """
-        Autoregressively generate audio code IDs using the megakernel.
-        The code_predictor (residual codebooks) is intentionally NOT called here
-        — this generates first-codebook tokens only.
+        if self._text_projection is None or self._text_embed_raw is None:
+            # Fallback: use audio embed table with text token IDs directly
+            # (poor quality but keeps the pipeline running)
+            for tid in text_token_ids[:-1]:
+                self._step(tid % TTS_AUDIO_VOCAB)
+            return self._step(text_token_ids[-1] % TTS_AUDIO_VOCAB)
+
+        ids_t = torch.tensor(text_token_ids, dtype=torch.long,
+                             device=self._text_embed_raw.device)
+        with torch.inference_mode():
+            raw = self._text_embed_raw[ids_t]              # [N, 2048]
+            proj = self._text_projection(raw.unsqueeze(0)).squeeze(0)  # [N, 1024]
+
+        self._trailing_text_hidden = proj.detach()
+        self._decode_step = 0
+
+        for i in range(len(text_token_ids) - 1):
+            self._step_with_embed(proj[i])
+        return self._step_with_embed(proj[-1])
+
+    # ── Audio code generation ─────────────────────────────────────────────────
+
+    def _compute_step_embed(self, first_code: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        codes = []
+        Compute the full 1024-dim input embedding for one decode step and
+        collect all 16 codebook codes.
+
+        Returns (step_embed [1024], all_codes [16]) where all_codes[0] = first_code
+        and all_codes[1:] = residual codes from code_predictor.
+        """
+        embed0 = self._audio_embed[first_code].float()   # [1024]
+
+        if self._code_predictor is not None:
+            embed0_t = embed0.unsqueeze(0).unsqueeze(0).to(torch.bfloat16)  # [1,1,1024]
+            with torch.inference_mode():
+                pred = self._code_predictor.generate(
+                    inputs_embeds=embed0_t,
+                    max_new_tokens=self._num_residual,
+                    do_sample=False,
+                )
+            residual_codes = pred.sequences[0].cpu()   # [15]
+            all_codes = torch.cat([torch.tensor([first_code]), residual_codes])  # [16]
+
+            residual_sum = torch.zeros(HIDDEN_SIZE, device="cuda", dtype=torch.float32)
+            embed_fns = self._code_predictor.get_input_embeddings()
+            for i in range(self._num_residual):
+                r_embed = embed_fns[i](
+                    pred.sequences[..., i:i+1].to(self._audio_embed.device)
+                ).float().squeeze()
+                residual_sum += r_embed
+            step_embed = embed0 + residual_sum
+        else:
+            all_codes  = torch.tensor([first_code])
+            step_embed = embed0
+
+        # Per-step text conditioning from trailing_text_hidden
+        if self._trailing_text_hidden is not None:
+            idx = min(self._decode_step, self._trailing_text_hidden.shape[0] - 1)
+            step_embed = step_embed + self._trailing_text_hidden[idx].float()
+
+        self._decode_step += 1
+        return step_embed.to(torch.bfloat16), all_codes
+
+    def generate_audio_codes_iter(self, first_code: int, max_tokens: int = 1024):
+        """
+        Generator: yields one all_codes tensor [16] per step until EOS or max_tokens.
+        Also advances the megakernel backbone one step per yield.
+        """
         token = first_code
         for _ in range(max_tokens):
             if token == self.codec_eos_id:
-                break
-            codes.append(token)
-            token = self._step(token)
-        return codes
+                return
+            step_embed, all_codes = self._compute_step_embed(token)
+            yield all_codes
+            token = self._step_with_embed(step_embed)
 
-    def decode_to_audio(self, codec_ids: list[int]) -> np.ndarray:
-        """Convert first-codebook codes to waveform via speech_tokenizer."""
+    def generate_audio_codes(self, first_code: int, max_tokens: int = 1024) -> list:
+        """Collect all codec code tensors (each [16]) into a list."""
+        return list(self.generate_audio_codes_iter(first_code, max_tokens))
+
+    def decode_to_audio(self, all_codec_codes: list) -> np.ndarray:
+        """
+        Decode a list of all_codes tensors (each [num_codebooks]) to waveform.
+
+        Calls speech_tokenizer.decode({"audio_codes": [num_codebooks, num_frames]}).
+        """
         if self.speech_tokenizer is None:
             raise RuntimeError("speech_tokenizer not available")
-        ids_t = torch.tensor(codec_ids, dtype=torch.long, device="cuda").unsqueeze(0)
-        with torch.no_grad():
-            audio = self.speech_tokenizer.decode(ids_t)
-        if isinstance(audio, torch.Tensor):
-            audio = audio.squeeze().float().cpu().numpy()
-        return audio
+        if not all_codec_codes:
+            return np.zeros(0, dtype=np.float32)
+
+        # Stack: [num_steps, num_codebooks] → transpose → [num_codebooks, num_steps]
+        codes_t = torch.stack(all_codec_codes, dim=0).T.long()
+        if codes_t.device.type != "cuda":
+            codes_t = codes_t.cuda()
+
+        with torch.inference_mode():
+            wavs, _ = self.speech_tokenizer.decode({"audio_codes": codes_t})
+        return np.array(wavs[0], dtype=np.float32)
 
 
 def benchmark(model_id: str = MODEL_ID, text: str = None, runs: int = 3):

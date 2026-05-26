@@ -114,29 +114,33 @@ class QwenTTSEngine:
 
         self._loaded = True
 
-    def _decode_codes_to_audio(self, codes: list[int]) -> np.ndarray | None:
-        """Convert a list of first-codebook audio code IDs to waveform."""
+    def _decode_codes_to_audio(self, codes_buffer) -> np.ndarray | None:
+        """
+        Decode a chunk of audio codes to waveform.
+
+        Megakernel path: codes_buffer is a list of Tensors each [num_codebooks].
+        HF baseline path: codes_buffer is a list of int (first-codebook only).
+        """
         if self._decoder and self._decoder.speech_tokenizer:
-            ids_t = torch.tensor(codes, dtype=torch.long, device="cuda").unsqueeze(0)
-            with torch.no_grad():
-                audio = self._decoder.speech_tokenizer.decode(ids_t)
+            if not codes_buffer:
+                return None
+            # Stack list of [num_codebooks] tensors → [num_codebooks, chunk]
+            codes_t = torch.stack(codes_buffer, dim=0).T.long()
+            if codes_t.device.type != "cuda":
+                codes_t = codes_t.cuda()
+            with torch.inference_mode():
+                wavs, _ = self._decoder.speech_tokenizer.decode({"audio_codes": codes_t})
+            return np.array(wavs[0], dtype=np.float32)
         elif self._hf_model:
-            st = None
-            if hasattr(self._hf_model, "model") and hasattr(self._hf_model.model, "speech_tokenizer"):
-                st = self._hf_model.model.speech_tokenizer
-            elif hasattr(self._hf_model, "speech_tokenizer"):
-                st = self._hf_model.speech_tokenizer
+            st = (getattr(getattr(self._hf_model, "model", None), "speech_tokenizer", None)
+                  or getattr(self._hf_model, "speech_tokenizer", None))
             if st is None:
                 return None
-            ids_t = torch.tensor(codes, dtype=torch.long, device="cuda").unsqueeze(0)
-            with torch.no_grad():
-                audio = st.decode(ids_t)
-        else:
-            return None
-
-        if isinstance(audio, torch.Tensor):
-            audio = audio.squeeze().float().cpu().numpy()
-        return audio
+            ids_t = torch.tensor(codes_buffer, dtype=torch.long, device="cuda").unsqueeze(0)
+            with torch.inference_mode():
+                wavs, _ = st.decode({"audio_codes": ids_t})
+            return np.array(wavs[0], dtype=np.float32)
+        return None
 
     async def stream(self, text: str) -> AsyncGenerator[bytes, None]:
         """
@@ -175,13 +179,10 @@ class QwenTTSEngine:
                 torch.cuda.synchronize()
 
                 buffer = []
-                token = first_code
-                for _ in range(self.max_audio_tokens):
-                    if token == decoder.codec_eos_id:
-                        break
-                    buffer.append(token)
-                    token = decoder._step(token)
-
+                for all_codes in decoder.generate_audio_codes_iter(
+                    first_code, self.max_audio_tokens
+                ):
+                    buffer.append(all_codes)
                     if len(buffer) >= self.chunk_codes:
                         audio = self._decode_codes_to_audio(buffer)
                         buffer = []
