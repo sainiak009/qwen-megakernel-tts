@@ -121,3 +121,26 @@ This is consistent with how we already probe `model.model.speech_tokenizer` else
 **Lesson:** Vendor wrapper classes (like `Qwen3TTSModel`) are not always `nn.Module` subclasses. Always check before calling PyTorch model methods on them.
 
 ---
+
+## Issue #4 — `Could not find talker audio embed_tokens (expected shape [3072, 1024])`
+
+**Error:**
+```
+Megakernel load failed (Could not find talker audio embed_tokens (expected shape [3072, 1024])); falling back to HF baseline.
+```
+
+**Cause:** Our code assumed the talker has two separate embedding tables — one for text tokens [151936, 1024] and one for audio tokens [3072, 1024]. In practice the talker uses a **single shared embed_tokens table** (likely [151936, 1024]) for both text and audio tokens. No separate [3072, 1024] audio embed exists in the state dict.
+
+**Fix:** Added a fallback: if no exact [3072, 1024] embed is found, slice the first `TTS_AUDIO_VOCAB` (3072) rows from the talker's embed table to use as the audio embed. Also added a diagnostic print of all embed keys on load so the actual shapes are visible in logs.
+
+```python
+# Fallback: slice first 3072 rows from shared embed table
+for k, v in sd.items():
+    if "embed_tokens" in k and prefix in k and v.shape[0] >= TTS_AUDIO_VOCAB:
+        audio_embed = v[:TTS_AUDIO_VOCAB].contiguous()
+        break
+```
+
+Similarly, the text prefill path now falls back to using the full talker embed table if no 151936-row embed is found separately.
+
+**Lesson:** Don't assume a TTS model stores separate embedding tables for text and audio. Inspect the actual state dict keys and shapes before writing the weight extraction logic.
