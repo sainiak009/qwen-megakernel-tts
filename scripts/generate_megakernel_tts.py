@@ -485,6 +485,7 @@ class TalkerDecoder:
                     inputs_embeds=pred_input,
                     max_new_tokens=self._num_residual,
                     do_sample=False,
+                    return_dict_in_generate=True,
                 )
             residual_codes = pred.sequences[0].cpu()   # [15]
             all_codes = torch.cat([torch.tensor([first_code]), residual_codes])  # [16]
