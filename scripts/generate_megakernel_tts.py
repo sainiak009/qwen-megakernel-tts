@@ -538,8 +538,9 @@ class TalkerDecoder:
         if not all_codec_codes:
             return np.zeros(0, dtype=np.float32)
 
-        # Stack: [num_steps, num_codebooks] → transpose → [num_codebooks, num_steps]
-        codes_t = torch.stack(all_codec_codes, dim=0).T.long()
+        # Stack: [num_steps, num_codebooks] — speech_tokenizer.decode() expects [frames, codebooks]
+        # (it internally does transpose(1,2) before passing to the audio decoder)
+        codes_t = torch.stack(all_codec_codes, dim=0).long()
         if codes_t.device.type != "cuda":
             codes_t = codes_t.cuda()
 

@@ -124,8 +124,9 @@ class QwenTTSEngine:
         if self._decoder and self._decoder.speech_tokenizer:
             if not codes_buffer:
                 return None
-            # Stack list of [num_codebooks] tensors → [num_codebooks, chunk]
-            codes_t = torch.stack(codes_buffer, dim=0).T.long()
+            # Stack list of [num_codebooks] tensors → [chunk, num_codebooks]
+            # speech_tokenizer.decode() internally transposes (1,2), so it expects [frames, codebooks]
+            codes_t = torch.stack(codes_buffer, dim=0).long()
             if codes_t.device.type != "cuda":
                 codes_t = codes_t.cuda()
             with torch.inference_mode():
