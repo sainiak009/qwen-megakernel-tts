@@ -51,7 +51,7 @@ def _get_engine() -> QwenTTSEngine:
     if _engine is None:
         _engine = QwenTTSEngine(
             model_id=os.environ.get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
-            use_megakernel=os.environ.get("USE_MEGAKERNEL", "1") == "1",
+            use_megakernel=os.environ.get("USE_MEGAKERNEL", "0") == "1",
             chunk_codes=int(os.environ.get("CHUNK_CODES", "12")),
             verbose=True,
         )
@@ -82,7 +82,7 @@ async def health():
     return {
         "status": "ok",
         "model": os.environ.get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
-        "backend": "megakernel" if os.environ.get("USE_MEGAKERNEL", "1") == "1" else "hf_baseline",
+        "backend": "megakernel" if os.environ.get("USE_MEGAKERNEL", "0") == "1" else "hf_baseline",
         "sample_rate": SAMPLE_RATE,
     }
 
