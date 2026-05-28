@@ -32,6 +32,7 @@ from collections.abc import AsyncGenerator
 import aiohttp
 from loguru import logger
 
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     EndFrame,
     Frame,
@@ -44,6 +45,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.tts_service import TTSService
@@ -164,8 +166,6 @@ async def main():
             camera_out_enabled=False,
             transcription_enabled=False,
         ),
-        # VAD: pipecat 1.2 moved VAD out of DailyParams. Wire a separate
-        # analyzer (e.g. SileroVADAnalyzer) into the pipeline if needed.
     )
 
     stt = DeepgramSTTService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
@@ -176,6 +176,8 @@ async def main():
     )
 
     tts = QwenTTSService(server_url=TTS_SERVER_URL)
+
+    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=SAMPLE_RATE))
 
     context = LLMContext(
         messages=[
@@ -193,6 +195,7 @@ async def main():
     pipeline = Pipeline(
         [
             transport.input(),
+            vad,
             stt,
             context_aggregator.user(),
             llm,
