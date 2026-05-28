@@ -490,3 +490,102 @@ into `self._norm_out` (float32) after every step. We capture it as `[1, 1, 1024]
 
 **Lesson:** When calling a vendor model's sub-module directly, read its `forward()` signature
 carefully — hidden state conditioning context (`past_hidden`) is a required input, not optional.
+
+---
+
+## Issue #11 — pipecat 1.2 API migration (Daily transport, LLMContext, VAD)
+
+**Error chain (encountered in this order on `python pipecat_demo/bot.py`):**
+
+```
+ModuleNotFoundError: No module named 'pipecat.processors.aggregators.openai_llm_context'
+…then…
+ModuleNotFoundError: No module named 'deepgram'
+…then…
+ModuleNotFoundError: No module named 'pipecat.transports.services'
+…then (at runtime)…
+TypeError: DailyParams got unexpected kwargs 'vad_enabled', 'vad_analyze_audio'
+…then (warning)…
+DeprecationWarning: The `model` parameter is deprecated. Use `settings=OpenAILLMService.Settings(model=...)` instead.
+```
+
+**Root cause:** The original `pipecat_demo/bot.py` targeted pre-1.2 pipecat
+(roughly 0.0.x). Between then and now, four breaking changes happened:
+
+1. **`OpenAILLMContext` removed**, replaced by the generic `LLMContext`
+   (provider-agnostic). Lives at
+   `pipecat.processors.aggregators.llm_context.LLMContext`.
+2. **`LLMService.create_context_aggregator(context)` removed.** Construct
+   `LLMContextAggregatorPair(context=context)` directly from
+   `pipecat.processors.aggregators.llm_response_universal`.
+3. **Daily transport moved.** `pipecat.transports.services.daily` →
+   `pipecat.transports.daily.transport`.
+4. **VAD removed from `DailyParams`.** `vad_enabled` / `vad_analyze_audio`
+   no longer exist; VAD is now a separate pipeline stage. Construct
+   `SileroVADAnalyzer(sample_rate=...)`, wrap in `VADProcessor`, and insert
+   right after `transport.input()`.
+5. **`OpenAILLMService(model=...)` deprecated.** Use
+   `OpenAILLMService(settings=OpenAILLMService.Settings(model=...))`.
+
+The `deepgram` / `daily-python` `ModuleNotFoundError`s are a separate symptom
+of missing install extras — the `pipecat-ai` core wheel doesn't pull these in.
+
+**Fix (commits `9b71e5c`, `ea3d415`, `1da21aa`, `70fd9fb`):**
+
+```python
+# imports
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.transports.daily.transport import DailyParams, DailyTransport
+
+# OpenAI service
+llm = OpenAILLMService(
+    api_key=os.environ.get("OPENAI_API_KEY", ""),
+    settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+)
+
+# VAD stage
+vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=SAMPLE_RATE))
+
+# DailyParams — VAD kwargs removed
+DailyParams(
+    api_key=daily_api_key,
+    audio_in_enabled=True,
+    audio_out_enabled=True,
+    camera_out_enabled=False,
+    transcription_enabled=False,
+)
+
+# Context + aggregator
+context = LLMContext(messages=[{"role": "system", "content": "..."}])
+context_aggregator = LLMContextAggregatorPair(context=context)
+
+# Pipeline gains a VAD stage after transport.input()
+pipeline = Pipeline([
+    transport.input(),
+    vad,
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+Install extras the core wheel doesn't pull in:
+
+```bash
+pip install 'pipecat-ai[daily,deepgram,openai,silero]'
+```
+
+**Verification:** With dummy keys, `bot.py` reaches `PipelineRunner.run(task)`
+and Deepgram's websocket returns HTTP 401 — the entire pipeline is wired and
+running; only the dummy credentials are being rejected.
+
+**Lesson:** Pin pipecat in `requirements.txt` (e.g. `pipecat-ai>=1.2,<2`) and
+note the install extras explicitly. The framework's pre-1.0 → 1.0+ jump
+churned half a dozen module paths and removed all OpenAI-specific helpers in
+favor of generic equivalents.

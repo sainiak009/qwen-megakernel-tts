@@ -251,6 +251,22 @@ pipeline = Pipeline([
 The Silero model is downloaded on first run; `sample_rate=24000` matches the
 incoming Daily audio track.
 
+### Verification
+
+The full pipeline is launch-tested. With dummy credentials, `bot.py`:
+
+1. Imports cleanly against pipecat 1.2.1 (no deprecation warnings).
+2. Constructs `DailyTransport`, `DeepgramSTTService`, `OpenAILLMService`
+   (`OpenAILLMService.Settings(model="gpt-4o-mini")`), `VADProcessor`
+   (`SileroVADAnalyzer(sample_rate=24000)`), `QwenTTSService`.
+3. Composes the 8-stage pipeline above.
+4. Starts `PipelineRunner.run(task)`.
+5. Reaches Deepgram's websocket, gets **HTTP 401 "Token dummy"** — the live
+   handshake completed; only the dummy key is rejected.
+
+That 401 is the strongest signal short of real credentials: everything is
+wired. To go fully live, swap the four env vars for real keys.
+
 ---
 
 ## File structure
