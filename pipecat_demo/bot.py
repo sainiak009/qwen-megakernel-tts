@@ -172,7 +172,7 @@ async def main():
 
     llm = OpenAILLMService(
         api_key=os.environ.get("OPENAI_API_KEY", ""),
-        model="gpt-4o-mini",
+        settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
     )
 
     tts = QwenTTSService(server_url=TTS_SERVER_URL)
