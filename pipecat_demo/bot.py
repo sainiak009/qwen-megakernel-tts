@@ -47,7 +47,7 @@ from pipecat.processors.aggregators.llm_response_universal import LLMContextAggr
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.tts_service import TTSService
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.daily.transport import DailyParams, DailyTransport
 
 TTS_SERVER_URL = os.environ.get("TTS_SERVER_URL", "http://localhost:8080")
 SAMPLE_RATE = 24_000
@@ -162,10 +162,10 @@ async def main():
             audio_in_enabled=True,
             audio_out_enabled=True,
             camera_out_enabled=False,
-            vad_enabled=True,
-            vad_analyze_audio=True,
             transcription_enabled=False,
         ),
+        # VAD: pipecat 1.2 moved VAD out of DailyParams. Wire a separate
+        # analyzer (e.g. SileroVADAnalyzer) into the pipeline if needed.
     )
 
     stt = DeepgramSTTService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
