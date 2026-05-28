@@ -42,7 +42,8 @@ from pipecat.frames.frames import (
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.tts_service import TTSService
@@ -176,7 +177,7 @@ async def main():
 
     tts = QwenTTSService(server_url=TTS_SERVER_URL)
 
-    context = OpenAILLMContext(
+    context = LLMContext(
         messages=[
             {
                 "role": "system",
@@ -187,7 +188,7 @@ async def main():
             }
         ]
     )
-    context_aggregator = llm.create_context_aggregator(context)
+    context_aggregator = LLMContextAggregatorPair(context=context)
 
     pipeline = Pipeline(
         [
