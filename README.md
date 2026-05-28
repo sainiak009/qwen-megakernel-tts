@@ -195,6 +195,14 @@ Environment variables:
 
 ## Pipecat demo
 
+Targets **pipecat-ai 1.2.x**. Install with the transport/STT/LLM extras:
+
+```bash
+pip install 'pipecat-ai[daily,deepgram,openai,silero]'
+```
+
+Then:
+
 ```bash
 # 1. Start the TTS server
 uvicorn server.app:app --port 8080 &
@@ -209,10 +217,39 @@ export OPENAI_API_KEY=...
 python pipecat_demo/bot.py
 ```
 
-The pipeline: `Mic → Deepgram STT → GPT-4o-mini → QwenTTSService → Speaker`
+The pipeline:
+`Mic → VAD (Silero) → Deepgram STT → GPT-4o-mini → QwenTTSService → Speaker`
 
 `QwenTTSService` pushes `TTSAudioRawFrame` to Pipecat as each PCM chunk arrives
 from the SSE stream — audio is never buffered before sending.
+
+### VAD wiring (pipecat 1.2)
+
+VAD moved out of `DailyParams` in pipecat 1.2 — it is now a pipeline stage.
+`bot.py` constructs a `SileroVADAnalyzer` and wraps it in a `VADProcessor`
+inserted right after `transport.input()`, so downstream stages only see
+voiced segments:
+
+```python
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.audio.vad_processor import VADProcessor
+
+vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=SAMPLE_RATE))
+
+pipeline = Pipeline([
+    transport.input(),
+    vad,                            # ← VAD here, before STT
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+The Silero model is downloaded on first run; `sample_rate=24000` matches the
+incoming Daily audio track.
 
 ---
 
